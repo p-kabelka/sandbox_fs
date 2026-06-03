@@ -882,9 +882,12 @@ def main():
     d.add_argument("mountpoint", help="FUSE mount point")
     d.add_argument("--control-socket", "-s", default=None,
                    help="Control socket path (default: <mountpoint>.sock)")
-    d.add_argument("--mount", "-m", action="append", default=[],
-                   metavar="SRC:TGT[:ro|rw]",
-                   help="Initial mount (repeatable)")
+    d.add_argument("--ro-mount", action="append", default=[],
+                   metavar="SRC[:TGT]",
+                   help="Read-only mount (repeatable)")
+    d.add_argument("--rw-mount", action="append", default=[],
+                   metavar="SRC[:TGT]",
+                   help="Read-write mount (repeatable)")
     d.add_argument("--hide", action="append", default=[],
                    metavar="TGT:RELPATH",
                    help="Initial hide (repeatable)")
@@ -896,7 +899,7 @@ def main():
     m = sub.add_parser("mount", help="Add a mount to running daemon")
     m.add_argument("-s", "--socket", required=True)
     m.add_argument("source")
-    m.add_argument("target")
+    m.add_argument("target", nargs="?", default=None)
     m.add_argument("-w", "--writable", action="store_true")
 
     # -- unmount --
@@ -933,17 +936,16 @@ def main():
             attr_timeout=args.attr_timeout,
         )
 
-        # Parse initial mounts: SRC:TGT[:ro|rw]
-        for spec in args.mount:
-            parts = spec.split(":")
-            if len(parts) < 2:
-                p.error(f"Bad mount spec (need SRC:TGT[:ro|rw]): {spec}")
-            src, tgt = parts[0], parts[1]
-            rw = len(parts) > 2 and parts[2] == "rw"
-            try:
-                fs.add_mount(src, tgt, rw)
-            except Exception as e:
-                p.error(f"Mount failed ({spec}): {e}")
+        # Parse initial mounts
+        for rw, specs in [(False, args.ro_mount), (True, args.rw_mount)]:
+            for spec in specs:
+                parts = spec.split(":", 1)
+                src = parts[0]
+                tgt = parts[1] if len(parts) > 1 else os.path.basename(src)
+                try:
+                    fs.add_mount(src, tgt, rw)
+                except Exception as e:
+                    p.error(f"Mount failed ({spec}): {e}")
 
         # Parse initial hides: TGT:RELPATH
         for spec in args.hide:
@@ -976,10 +978,11 @@ def main():
             pyfuse3.close(unmount=True)
 
     elif args.cmd == "mount":
+        target = args.target or os.path.basename(os.path.realpath(args.source))
         _print_result(_send(args.socket, {
             "action": "mount",
             "source": args.source,
-            "target": args.target,
+            "target": target,
             "writable": args.writable,
         }))
 

@@ -1236,6 +1236,15 @@ def _print_load_result(resp: dict):
 # CLI
 # ---------------------------------------------------------------------------
 
+def _only_keyboard_interrupts(error: BaseException) -> bool:
+    if isinstance(error, KeyboardInterrupt):
+        return True
+    nested = getattr(error, "exceptions", ())
+    return bool(nested) and all(
+        _only_keyboard_interrupts(child) for child in nested
+    )
+
+
 def main():
     p = argparse.ArgumentParser(
         description="Sandbox FUSE filesystem with dynamic mount management"
@@ -1357,6 +1366,9 @@ def main():
             trio.run(pyfuse3.main)
         except KeyboardInterrupt:
             pass
+        except BaseException as e:
+            if not _only_keyboard_interrupts(e):
+                raise
         finally:
             ctl.stop()
             pyfuse3.close(unmount=True)

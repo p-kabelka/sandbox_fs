@@ -274,8 +274,9 @@ class SandboxFS(pyfuse3.Operations):
                 "hidden": set(),
             }
 
-        # Invalidate parent directory in kernel cache
+        # Drop both the cached directory entry and any cached readdir data.
         try:
+            pyfuse3.invalidate_entry(parent_ino, name.encode())
             pyfuse3.invalidate_inode(parent_ino)
         except Exception:
             pass
@@ -288,7 +289,7 @@ class SandboxFS(pyfuse3.Operations):
             if target not in self._mounts:
                 raise ValueError(f"Not mounted: {target}")
 
-            self._mounts.pop(target)
+            info = self._mounts.pop(target)
 
             self._rebuild_hidden()
 
@@ -330,6 +331,9 @@ class SandboxFS(pyfuse3.Operations):
                         break
 
         try:
+            pyfuse3.invalidate_entry(
+                parent_ino, parts[-1].encode(), deleted=info["inode"]
+            )
             pyfuse3.invalidate_inode(parent_ino)
         except Exception:
             pass
@@ -358,9 +362,16 @@ class SandboxFS(pyfuse3.Operations):
             parent_real = os.path.dirname(abs_path)
             parent_key = (mount_target, parent_real)
             if parent_key in self._path_to_ino:
-                pyfuse3.invalidate_inode(self._path_to_ino[parent_key])
+                parent_ino = self._path_to_ino[parent_key]
             elif parent_real == info["source"]:
-                pyfuse3.invalidate_inode(info["inode"])
+                parent_ino = info["inode"]
+            else:
+                parent_ino = None
+            if parent_ino is not None:
+                pyfuse3.invalidate_entry(
+                    parent_ino, os.path.basename(abs_path).encode()
+                )
+                pyfuse3.invalidate_inode(parent_ino)
         except Exception:
             pass
         log.info("Hidden %s in mount %s", rel_path, mount_target)
@@ -383,9 +394,16 @@ class SandboxFS(pyfuse3.Operations):
             parent_real = os.path.dirname(abs_path)
             parent_key = (mount_target, parent_real)
             if parent_key in self._path_to_ino:
-                pyfuse3.invalidate_inode(self._path_to_ino[parent_key])
+                parent_ino = self._path_to_ino[parent_key]
             elif parent_real == info["source"]:
-                pyfuse3.invalidate_inode(info["inode"])
+                parent_ino = info["inode"]
+            else:
+                parent_ino = None
+            if parent_ino is not None:
+                pyfuse3.invalidate_entry(
+                    parent_ino, os.path.basename(abs_path).encode()
+                )
+                pyfuse3.invalidate_inode(parent_ino)
         except Exception:
             pass
         log.info("Unhidden %s in mount %s", rel_path, mount_target)

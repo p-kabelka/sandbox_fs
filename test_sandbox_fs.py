@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 
 try:
@@ -16,6 +17,7 @@ except ModuleNotFoundError:
     pyfuse3.EntryAttributes = type("EntryAttributes", (), {})
     pyfuse3.FileInfo = type("FileInfo", (), {})
     pyfuse3.default_options = set()
+    pyfuse3.invalidate_entry = lambda inode, name, deleted=0: None
     pyfuse3.invalidate_inode = lambda ino: None
     sys.modules["pyfuse3"] = pyfuse3
 
@@ -211,6 +213,33 @@ class StatePersistenceTests(unittest.TestCase):
         self.assertNotEqual(ro_attr.st_ino, rw_attr.st_ino)
         self.assertFalse(fs._inodes[ro_attr.st_ino].writable)
         self.assertTrue(fs._inodes[rw_attr.st_ino].writable)
+
+    def test_dynamic_changes_invalidate_kernel_entries(self):
+        fs = SandboxFS()
+        with (
+            mock.patch.object(pyfuse3, "invalidate_entry") as invalidate_entry,
+            mock.patch.object(pyfuse3, "invalidate_inode"),
+        ):
+            fs.add_mount(self.sources[1], "/mount")
+            mount_ino = fs._mounts["/mount"]["inode"]
+            invalidate_entry.assert_called_with(
+                pyfuse3.ROOT_INODE, b"mount"
+            )
+
+            fs.add_hide("/mount", self.hidden_path)
+            invalidate_entry.assert_called_with(
+                mount_ino, self.hidden_path.encode()
+            )
+
+            fs.remove_hide("/mount", self.hidden_path)
+            invalidate_entry.assert_called_with(
+                mount_ino, self.hidden_path.encode()
+            )
+
+            fs.remove_mount("/mount")
+            invalidate_entry.assert_called_with(
+                pyfuse3.ROOT_INODE, b"mount", deleted=mount_ino
+            )
 
     def test_load_rejects_empty_hidden_path(self):
         fs = SandboxFS()

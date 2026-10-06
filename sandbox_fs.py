@@ -7,10 +7,10 @@ with fine-grained read/write control and path hiding. Supports runtime
 reconfiguration via a Unix domain socket without restarting.
 
 Usage:
-  # Start the daemon
-  sandbox_fs.py daemon /mnt/sandbox \\
-      -m /home/user/project:/home/user/project:rw \\
-      -m /home/user/reference:/home/user/reference \\
+   # Start the daemon
+   sandbox_fs.py daemon /mnt/sandbox \\
+       --rw-mount /home/user/project:/home/user/project \\
+       --ro-mount /home/user/reference:/home/user/reference \\
       --hide /home/user/project:.env
 
   # Add a mount at runtime
@@ -29,8 +29,15 @@ Usage:
   sandbox_fs.py save -s /mnt/sandbox.sock sandbox-state.json
   sandbox_fs.py load -s /mnt/sandbox.sock sandbox-state.json
 
-  # Remove a mount
-  sandbox_fs.py unmount -s /mnt/sandbox.sock /virtual/path
+   # Remove a mount
+   sandbox_fs.py unmount -s /mnt/sandbox.sock /virtual/path
+
+   # Inspect or update cache timeouts (seconds; defaults are 5)
+   sandbox_fs.py timeouts -s /mnt/sandbox.sock
+   sandbox_fs.py timeouts -s /mnt/sandbox.sock --entry-timeout 1 --attr-timeout 1
+
+   # Immediately invalidate cached attributes, contents, and directory entries
+   sandbox_fs.py invalidate-cache -s /mnt/sandbox.sock
 
 Requires: pyfuse3, trio
 Install:  pip install pyfuse3 trio
@@ -40,6 +47,7 @@ import argparse
 import errno
 import json
 import logging
+import math
 import os
 import socket
 import stat
@@ -54,6 +62,27 @@ import trio
 log = logging.getLogger("sandboxfs")
 
 _ROOT_INO = pyfuse3.ROOT_INODE
+_DEFAULT_CACHE_TIMEOUT = 5.0
+
+
+def _validate_timeout(value) -> float:
+    message = "Timeout must be a finite, non-negative number of seconds"
+    if isinstance(value, bool):
+        raise ValueError(message)
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(message) from None
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError(message)
+    return timeout
+
+
+def _timeout_argument(value: str) -> float:
+    try:
+        return _validate_timeout(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
 
 
 def _normalize_mount_target(target: str) -> str:
@@ -114,9 +143,11 @@ class _Handle:
 
 class SandboxFS(pyfuse3.Operations):
 
-    def __init__(self, entry_timeout: float = 300, attr_timeout: float = 300):
+    def __init__(self, entry_timeout: float = _DEFAULT_CACHE_TIMEOUT,
+                 attr_timeout: float = _DEFAULT_CACHE_TIMEOUT):
         super().__init__()
         self._lock = threading.RLock()
+        self._cache_control_lock = threading.Lock()
         self._ino_counter = _ROOT_INO
         self._inodes: dict[int, _Inode] = {}
         self._path_to_ino: dict[tuple[str, str], int] = {}
@@ -124,8 +155,8 @@ class SandboxFS(pyfuse3.Operations):
         self._fh_counter = 0
         self._mounts: dict[str, dict] = {}     # target -> mount info
         self._hidden: set[tuple[str, str]] = set()
-        self._entry_timeout = entry_timeout
-        self._attr_timeout = attr_timeout
+        self._entry_timeout = _validate_timeout(entry_timeout)
+        self._attr_timeout = _validate_timeout(attr_timeout)
 
         root = _Inode(ino=_ROOT_INO, lookup_count=1)
         self._inodes[_ROOT_INO] = root
@@ -186,6 +217,11 @@ class SandboxFS(pyfuse3.Operations):
 
     # -- attribute helpers --------------------------------------------------
 
+    def _set_attr_timeouts(self, entry: pyfuse3.EntryAttributes):
+        with self._lock:
+            entry.entry_timeout = self._entry_timeout
+            entry.attr_timeout = self._attr_timeout
+
     def _fill_attr(self, entry: pyfuse3.EntryAttributes,
                    st: os.stat_result, ino: int, writable: bool):
         entry.st_ino = ino
@@ -202,8 +238,7 @@ class SandboxFS(pyfuse3.Operations):
         entry.st_rdev = getattr(st, "st_rdev", 0)
         if not writable:
             entry.st_mode &= ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
-        entry.entry_timeout = self._entry_timeout
-        entry.attr_timeout = self._attr_timeout
+        self._set_attr_timeouts(entry)
 
     def _virtual_attr(self, ino: int) -> pyfuse3.EntryAttributes:
         e = pyfuse3.EntryAttributes()
@@ -216,9 +251,89 @@ class SandboxFS(pyfuse3.Operations):
         e.st_atime_ns = 0
         e.st_mtime_ns = 0
         e.st_ctime_ns = 0
-        e.entry_timeout = self._entry_timeout
-        e.attr_timeout = self._attr_timeout
+        self._set_attr_timeouts(e)
         return e
+
+    # -- cache management ---------------------------------------------------
+
+    def get_timeouts(self) -> dict:
+        with self._lock:
+            return {
+                "entry_timeout": self._entry_timeout,
+                "attr_timeout": self._attr_timeout,
+            }
+
+    def set_timeouts(self, entry_timeout: float | None = None,
+                     attr_timeout: float | None = None) -> dict:
+        # Validate both before changing either, so a bad request is atomic.
+        entry = None if entry_timeout is None else _validate_timeout(entry_timeout)
+        attr = None if attr_timeout is None else _validate_timeout(attr_timeout)
+        with self._cache_control_lock:
+            with self._lock:
+                if entry is not None:
+                    self._entry_timeout = entry
+                if attr is not None:
+                    self._attr_timeout = attr
+
+            if entry is None and attr is None:
+                return {"ok": True, "timeouts": self.get_timeouts()}
+
+            # Old kernel TTLs must be invalidated as well as updating future
+            # replies. Notifications run without _lock, on the control thread.
+            result = self._invalidate_cache()
+            result["timeouts"] = self.get_timeouts()
+            if not result["ok"]:
+                result["error"] = (
+                    "Timeouts updated, but some cache entries could not be invalidated"
+                )
+            log.info("Cache timeouts updated: %s", result["timeouts"])
+            return result
+
+    def invalidate_cache(self) -> dict:
+        with self._cache_control_lock:
+            return self._invalidate_cache()
+
+    def _invalidate_cache(self) -> dict:
+        with self._lock:
+            inodes = list(self._inodes)
+            entries = {
+                (node.ino, os.fsencode(name))
+                for node in self._inodes.values()
+                for name in node.children
+            }
+            for (target, real_path) in self._path_to_ino:
+                parent_ino = self._path_to_ino.get(
+                    (target, os.path.dirname(real_path))
+                )
+                if parent_ino is not None:
+                    entries.add((parent_ino, os.fsencode(os.path.basename(real_path))))
+
+        result = {"ok": True, "inodes": 0, "entries": 0, "failed": []}
+        # Notifications can wait for FUSE requests. Never hold _lock here:
+        # those requests need it to complete. ENOENT means already uncached.
+        for ino in inodes:
+            try:
+                pyfuse3.invalidate_inode(ino)
+                result["inodes"] += 1
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    result["failed"].append(f"inode {ino}: {e}")
+
+        for parent_ino, name in sorted(entries):
+            try:
+                pyfuse3.invalidate_entry(parent_ino, name)
+                result["entries"] += 1
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    result["failed"].append(
+                        f"entry {parent_ino}/{os.fsdecode(name)}: {e}"
+                    )
+
+        result["ok"] = not result["failed"]
+        if not result["ok"]:
+            result["error"] = "Some cache entries could not be invalidated"
+        log.info("Cache invalidation: %s", result)
+        return result
 
     # -- mount management ---------------------------------------------------
 
@@ -820,6 +935,14 @@ class SandboxFS(pyfuse3.Operations):
         h = self._handles[fh]
         for idx in range(start_id, len(h.dir_entries)):
             name, attr = h.dir_entries[idx]
+            # Keep names/cookies stable for this directory handle, but fetch
+            # current metadata and TTLs instead of republishing stale snapshots.
+            try:
+                attr = await self.getattr(attr.st_ino)
+            except pyfuse3.FUSEError as e:
+                if e.errno == errno.ENOENT:
+                    continue
+                raise
             if not pyfuse3.readdir_reply(token, name, attr, idx + 1):
                 return
 
@@ -1131,6 +1254,16 @@ class ControlServer:
                 return {"ok": True}
             elif action == "list":
                 return {"ok": True, "mounts": self._fs.list_mounts()}
+            elif action == "timeouts":
+                for key in ("entry_timeout", "attr_timeout"):
+                    if key in req:
+                        _validate_timeout(req[key])
+                return self._fs.set_timeouts(
+                    entry_timeout=req.get("entry_timeout"),
+                    attr_timeout=req.get("attr_timeout"),
+                )
+            elif action == "invalidate-cache":
+                return self._fs.invalidate_cache()
             elif action == "load":
                 result = self._fs.load_mounts(
                     req["mounts"],
@@ -1185,6 +1318,20 @@ def _print_result(resp: dict):
     else:
         print(f"Error: {resp.get('error')}", file=sys.stderr)
         sys.exit(1)
+
+
+def _print_cache_result(resp: dict):
+    if "timeouts" in resp:
+        timeouts = resp["timeouts"]
+        print(f"Entry timeout: {timeouts['entry_timeout']:g} seconds")
+        print(f"Attribute timeout: {timeouts['attr_timeout']:g} seconds")
+    if "inodes" in resp:
+        print(f"Invalidated: {resp['inodes']} inodes, "
+              f"{resp['entries']} directory entries")
+    if not resp.get("ok"):
+        for failure in resp.get("failed", []):
+            print(f"Failed: {failure}", file=sys.stderr)
+        _print_result(resp)
 
 
 def _read_state(path: str) -> list:
@@ -1265,8 +1412,12 @@ def main():
     d.add_argument("--hide", action="append", default=[],
                    metavar="TGT:RELPATH",
                    help="Initial hide (repeatable)")
-    d.add_argument("--entry-timeout", type=float, default=300)
-    d.add_argument("--attr-timeout", type=float, default=300)
+    d.add_argument("--entry-timeout", type=_timeout_argument,
+                   default=_DEFAULT_CACHE_TIMEOUT,
+                   help="Directory-entry cache TTL in seconds (default: 5; 0 disables)")
+    d.add_argument("--attr-timeout", type=_timeout_argument,
+                   default=_DEFAULT_CACHE_TIMEOUT,
+                   help="Attribute cache TTL in seconds (default: 5; 0 disables)")
     d.add_argument("--debug", action="store_true")
 
     # -- mount --
@@ -1297,6 +1448,24 @@ def main():
     # -- list --
     ls = sub.add_parser("list", help="List mounts and hides")
     ls.add_argument("-s", "--socket", required=True)
+
+    # -- cache controls --
+    timeouts = sub.add_parser(
+        "timeouts", help="Show or change cache timeouts in a running daemon"
+    )
+    timeouts.add_argument("-s", "--socket", required=True)
+    timeouts.add_argument(
+        "--entry-timeout", type=_timeout_argument, default=None,
+        help="Directory-entry cache TTL in seconds (omit to keep current value)",
+    )
+    timeouts.add_argument(
+        "--attr-timeout", type=_timeout_argument, default=None,
+        help="Attribute cache TTL in seconds (omit to keep current value)",
+    )
+    invalidate = sub.add_parser(
+        "invalidate-cache", help="Immediately invalidate all cached entries, attributes, and data"
+    )
+    invalidate.add_argument("-s", "--socket", required=True)
 
     # -- save --
     save = sub.add_parser("save", help="Save mounts and hides to a JSON file")
@@ -1403,6 +1572,17 @@ def main():
 
     elif args.cmd == "list":
         _print_result(_send(args.socket, {"action": "list"}))
+
+    elif args.cmd == "timeouts":
+        command = {"action": "timeouts"}
+        for key in ("entry_timeout", "attr_timeout"):
+            value = getattr(args, key)
+            if value is not None:
+                command[key] = value
+        _print_cache_result(_send(args.socket, command))
+
+    elif args.cmd == "invalidate-cache":
+        _print_cache_result(_send(args.socket, {"action": "invalidate-cache"}))
 
     elif args.cmd == "save":
         resp = _send(args.socket, {"action": "list"})

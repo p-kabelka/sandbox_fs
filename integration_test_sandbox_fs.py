@@ -130,19 +130,20 @@ class FuseIntegrationTests(unittest.TestCase):
             process = self.process
             self.process = None
             if process.poll() is None:
-                process.terminate()
+                process.send_signal(signal.SIGINT)
                 try:
                     process.communicate(timeout=3)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.communicate(timeout=3)
 
-        if os.path.ismount(self.mountpoint):
-            subprocess.run(
-                [self.fusermount, "-u", "-z", str(self.mountpoint)],
-                capture_output=True,
-                text=True,
-            )
+        # A disconnected FUSE mount can make ismount() return False when its
+        # root attributes are uncached. Always attempt cleanup of our mount.
+        subprocess.run(
+            [self.fusermount, "-u", "-z", str(self.mountpoint)],
+            capture_output=True,
+            text=True,
+        )
 
     def _cli(self, *args, check=True):
         result = subprocess.run(
@@ -295,6 +296,64 @@ class FuseIntegrationTests(unittest.TestCase):
             "unhide", "-s", self.socket_path, "/writable", "secret.txt"
         )
         self.assertEqual(secret.read_text(encoding="utf-8"), "hidden data\n")
+
+    def test_runtime_timeouts_replace_long_lived_cached_attributes(self):
+        defaults = self._cli("timeouts", "-s", self.socket_path)
+        self.assertIn("Entry timeout: 5 seconds", defaults.stdout)
+        self.assertIn("Attribute timeout: 5 seconds", defaults.stdout)
+        self._cli("mount", "-s", self.socket_path, self.source_rw, "/shared")
+        shared = self.mountpoint / "shared/editable.txt"
+        self._cli(
+            "timeouts", "-s", self.socket_path,
+            "--entry-timeout", "300", "--attr-timeout", "300",
+        )
+        self.assertEqual(shared.stat().st_size, len("original data\n"))
+        updated = "longer externally updated contents\n"
+        (self.source_rw / "editable.txt").write_text(updated, encoding="utf-8")
+        # Establish that this test really populated the old long-lived TTL.
+        self.assertEqual(shared.stat().st_size, len("original data\n"))
+
+        changed = self._cli(
+            "timeouts", "-s", self.socket_path, "--attr-timeout", "0",
+        )
+        self.assertIn("Entry timeout: 300 seconds", changed.stdout)
+        self.assertEqual(shared.stat().st_size, len(updated))
+        self.assertEqual(shared.read_text(encoding="utf-8"), updated)
+        updated_again = "short\n"
+        (self.source_rw / "editable.txt").write_text(updated_again, encoding="utf-8")
+        self.assertEqual(shared.stat().st_size, len(updated_again))
+
+    def test_invalidate_cache_refreshes_open_file_data_and_directory_entries(self):
+        self._cli("mount", "-s", self.socket_path, self.source_rw, "/shared")
+        self._cli(
+            "timeouts", "-s", self.socket_path,
+            "--entry-timeout", "300", "--attr-timeout", "300",
+        )
+        shared = self.mountpoint / "shared/editable.txt"
+        shared.stat()
+        original = "original data\n"
+        updated = "modified data\n"
+        self.assertEqual(len(original), len(updated))
+        with open(shared, "rb", buffering=0) as reader:
+            self.assertEqual(reader.read(), original.encode())
+            (self.source_rw / "editable.txt").write_text(updated, encoding="utf-8")
+            reader.seek(0)
+            self.assertEqual(reader.read(), original.encode())
+            self._cli("invalidate-cache", "-s", self.socket_path)
+            reader.seek(0)
+            self.assertEqual(reader.read(), updated.encode())
+
+        deleted = self.mountpoint / "shared/secret.txt"
+        self.assertTrue(deleted.exists())
+        (self.source_rw / "secret.txt").unlink()
+        self.assertTrue(deleted.exists())
+        refreshed = self._cli("invalidate-cache", "-s", self.socket_path)
+        self.assertIn("Invalidated:", refreshed.stdout)
+        self.assertFalse(deleted.exists())
+        new_file = self.source_rw / "new.txt"
+        new_file.write_text("new file\n", encoding="utf-8")
+        self._cli("invalidate-cache", "-s", self.socket_path)
+        self.assertIn("new.txt", {entry.name for entry in shared.parent.iterdir()})
 
 
 if __name__ == "__main__":

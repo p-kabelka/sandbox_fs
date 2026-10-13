@@ -9,7 +9,6 @@ import types
 import unittest
 from unittest import mock
 
-
 try:
     import pyfuse3  # noqa: F401
 except ModuleNotFoundError:
@@ -18,10 +17,12 @@ except ModuleNotFoundError:
     pyfuse3.ROOT_INODE = 1
     pyfuse3.EntryAttributes = type("EntryAttributes", (), {})
     pyfuse3.FileInfo = types.SimpleNamespace
+
     class FUSEError(Exception):
         def __init__(self, error):
             self.errno = error
             super().__init__(os.strerror(error))
+
     pyfuse3.FUSEError = FUSEError
     pyfuse3.default_options = set()
     pyfuse3.invalidate_entry = lambda inode, name, deleted=0: None
@@ -67,9 +68,7 @@ class StatePersistenceTests(unittest.TestCase):
         fs.add_mount(self.sources[0], "/existing")
         desired = [
             self.config(self.sources[1], "/existing", writable=True),
-            self.config(
-                self.sources[1], "/new", hidden=[self.hidden_path]
-            ),
+            self.config(self.sources[1], "/new", hidden=[self.hidden_path]),
         ]
 
         first = fs.load_mounts(desired)
@@ -85,10 +84,14 @@ class StatePersistenceTests(unittest.TestCase):
     def test_force_overwrites_conflicting_target(self):
         fs = SandboxFS()
         fs.add_mount(self.sources[0], "/mount")
-        desired = [self.config(
-            self.sources[1], "/mount", writable=True,
-            hidden=[self.hidden_path],
-        )]
+        desired = [
+            self.config(
+                self.sources[1],
+                "/mount",
+                writable=True,
+                hidden=[self.hidden_path],
+            )
+        ]
 
         first = fs.load_mounts(desired, force=True)
         second = fs.load_mounts(desired, force=True)
@@ -104,24 +107,20 @@ class StatePersistenceTests(unittest.TestCase):
 
         fs = SandboxFS()
         fs.add_mount(self.sources[0], "/mount", writable=True)
-        old_attr = asyncio.run(fs.lookup(
-            fs._mounts["/mount"]["inode"], b"shared.txt"
-        ))
+        old_attr = asyncio.run(fs.lookup(fs._mounts["/mount"]["inode"], b"shared.txt"))
         desired = [self.config(self.sources[0], "/mount")]
 
         fs.load_mounts(desired, force=True)
-        new_attr = asyncio.run(fs.lookup(
-            fs._mounts["/mount"]["inode"], b"shared.txt"
-        ))
+        new_attr = asyncio.run(fs.lookup(fs._mounts["/mount"]["inode"], b"shared.txt"))
 
         self.assertFalse(fs._inodes[old_attr.st_ino].active)
         self.assertNotEqual(old_attr.st_ino, new_attr.st_ino)
         self.assertFalse(fs._inodes[new_attr.st_ino].writable)
 
         asyncio.run(fs.forget([(old_attr.st_ino, 1)]))
-        repeated_attr = asyncio.run(fs.lookup(
-            fs._mounts["/mount"]["inode"], b"shared.txt"
-        ))
+        repeated_attr = asyncio.run(
+            fs.lookup(fs._mounts["/mount"]["inode"], b"shared.txt")
+        )
         self.assertEqual(repeated_attr.st_ino, new_attr.st_ino)
 
     def test_replace_removes_mounts_not_in_saved_state(self):
@@ -142,9 +141,7 @@ class StatePersistenceTests(unittest.TestCase):
         original = fs.list_mounts()
         missing = os.path.join(self.temp_dir.name, "missing")
 
-        result = fs.load_mounts(
-            [self.config(missing, "/replacement")], replace=True
-        )
+        result = fs.load_mounts([self.config(missing, "/replacement")], replace=True)
 
         self.assertEqual(result["failed"][0]["target"], "/replacement")
         self.assertEqual(fs.list_mounts(), original)
@@ -155,9 +152,7 @@ class StatePersistenceTests(unittest.TestCase):
         original = fs.list_mounts()
 
         with self.assertRaisesRegex(ValueError, "Cannot mount at root"):
-            fs.load_mounts(
-                [self.config(self.sources[1], ".")], replace=True
-            )
+            fs.load_mounts([self.config(self.sources[1], ".")], replace=True)
 
         self.assertEqual(fs.list_mounts(), original)
 
@@ -184,17 +179,15 @@ class StatePersistenceTests(unittest.TestCase):
         fs.add_hide("/remove", self.hidden_path)
         fs.add_mount(self.sources[1], "/keep")
         fs.add_hide("/keep", self.hidden_path)
-        desired = [self.config(
-            self.sources[1], "/keep", hidden=[self.hidden_path]
-        )]
+        desired = [self.config(self.sources[1], "/keep", hidden=[self.hidden_path])]
 
         result = fs.load_mounts(desired, replace=True)
 
         self.assertEqual(result["removed"], ["/remove"])
         self.assertEqual(result["unchanged"], ["/keep"])
-        self.assertTrue(fs._is_hidden(
-            "/keep", os.path.join(self.sources[1], self.hidden_path)
-        ))
+        self.assertTrue(
+            fs._is_hidden("/keep", os.path.join(self.sources[1], self.hidden_path))
+        )
         self.assertEqual(fs.list_mounts(), desired)
 
     def test_shared_source_mounts_keep_independent_policy(self):
@@ -211,12 +204,12 @@ class StatePersistenceTests(unittest.TestCase):
         self.assertFalse(fs._is_hidden("/read-write", shared_file))
 
         fs.remove_hide("/read-only", "shared.txt")
-        ro_attr = asyncio.run(fs.lookup(
-            fs._mounts["/read-only"]["inode"], b"shared.txt"
-        ))
-        rw_attr = asyncio.run(fs.lookup(
-            fs._mounts["/read-write"]["inode"], b"shared.txt"
-        ))
+        ro_attr = asyncio.run(
+            fs.lookup(fs._mounts["/read-only"]["inode"], b"shared.txt")
+        )
+        rw_attr = asyncio.run(
+            fs.lookup(fs._mounts["/read-write"]["inode"], b"shared.txt")
+        )
         self.assertNotEqual(ro_attr.st_ino, rw_attr.st_ino)
         self.assertFalse(fs._inodes[ro_attr.st_ino].writable)
         self.assertTrue(fs._inodes[rw_attr.st_ino].writable)
@@ -229,19 +222,13 @@ class StatePersistenceTests(unittest.TestCase):
         ):
             fs.add_mount(self.sources[1], "/mount")
             mount_ino = fs._mounts["/mount"]["inode"]
-            invalidate_entry.assert_called_with(
-                pyfuse3.ROOT_INODE, b"mount"
-            )
+            invalidate_entry.assert_called_with(pyfuse3.ROOT_INODE, b"mount")
 
             fs.add_hide("/mount", self.hidden_path)
-            invalidate_entry.assert_called_with(
-                mount_ino, self.hidden_path.encode()
-            )
+            invalidate_entry.assert_called_with(mount_ino, self.hidden_path.encode())
 
             fs.remove_hide("/mount", self.hidden_path)
-            invalidate_entry.assert_called_with(
-                mount_ino, self.hidden_path.encode()
-            )
+            invalidate_entry.assert_called_with(mount_ino, self.hidden_path.encode())
 
             fs.remove_mount("/mount")
             invalidate_entry.assert_called_with(
@@ -252,9 +239,7 @@ class StatePersistenceTests(unittest.TestCase):
         fs = SandboxFS()
 
         with self.assertRaisesRegex(ValueError, "Hidden path cannot be empty"):
-            fs.load_mounts([
-                self.config(self.sources[0], "/mount", hidden=["."])
-            ])
+            fs.load_mounts([self.config(self.sources[0], "/mount", hidden=["."])])
 
     def test_state_file_is_two_space_indented_json(self):
         state_path = os.path.join(self.temp_dir.name, "state.json")
@@ -299,9 +284,7 @@ class PathWritePolicyTests(unittest.TestCase):
         self.fs = SandboxFS(entry_timeout=300, attr_timeout=300)
         self.fs.add_mount(self.source, "/project", writable=True)
         self.root = self.fs._mounts["/project"]["inode"]
-        self.control = ControlServer(
-            self.fs, os.path.join(self.source, "control.sock")
-        )
+        self.control = ControlServer(self.fs, os.path.join(self.source, "control.sock"))
 
     def lookup(self, path, fs=None, root=None):
         fs = fs or self.fs
@@ -332,7 +315,9 @@ class PathWritePolicyTests(unittest.TestCase):
             ino = self.lookup(path)
             fh = self.open_handle(ino)
             self.assertEqual(asyncio.run(self.fs.write(fh, 0, b"edited")), 6)
-        self.assertTrue(os.stat(os.path.join(self.source, ".git/config")).st_mode & 0o222)
+        self.assertTrue(
+            os.stat(os.path.join(self.source, ".git/config")).st_mode & 0o222
+        )
 
     def test_directory_handles_publish_current_readonly_attributes(self):
         fh = asyncio.run(self.fs.opendir(self.root, None))
@@ -344,7 +329,9 @@ class PathWritePolicyTests(unittest.TestCase):
             replies[name] = attr
             return True
 
-        with mock.patch.object(pyfuse3, "readdir_reply", side_effect=reply, create=True):
+        with mock.patch.object(
+            pyfuse3, "readdir_reply", side_effect=reply, create=True
+        ):
             asyncio.run(self.fs.readdir(fh, 0, object()))
         self.assertFalse(replies[b".git"].st_mode & 0o222)
         self.assertTrue(replies[b"work.txt"].st_mode & 0o222)
@@ -352,7 +339,9 @@ class PathWritePolicyTests(unittest.TestCase):
         git = self.lookup(".git")
         git_fh = asyncio.run(self.fs.opendir(git, None))
         self.addCleanup(lambda: asyncio.run(self.fs.releasedir(git_fh)))
-        with mock.patch.object(pyfuse3, "readdir_reply", side_effect=reply, create=True):
+        with mock.patch.object(
+            pyfuse3, "readdir_reply", side_effect=reply, create=True
+        ):
             asyncio.run(self.fs.readdir(git_fh, 0, object()))
         self.assertFalse(replies[b"config"].st_mode & 0o222)
 
@@ -375,14 +364,20 @@ class PathWritePolicyTests(unittest.TestCase):
         fh = self.open_handle(ino)
         self.fs.add_readonly("/project", ".git")
         attr = types.SimpleNamespace(
-            st_size=0, st_mode=0o777, st_uid=os.getuid(), st_gid=os.getgid(),
-            st_atime_ns=0, st_mtime_ns=0,
+            st_size=0,
+            st_mode=0o777,
+            st_uid=os.getuid(),
+            st_gid=os.getgid(),
+            st_atime_ns=0,
+            st_mtime_ns=0,
         )
         for field in ("size", "mode", "uid", "gid", "atime", "mtime"):
-            fields = types.SimpleNamespace(**{
-                "update_" + name: name == field
-                for name in ("size", "mode", "uid", "gid", "atime", "mtime")
-            })
+            fields = types.SimpleNamespace(
+                **{
+                    "update_" + name: name == field
+                    for name in ("size", "mode", "uid", "gid", "atime", "mtime")
+                }
+            )
             with self.subTest(field=field):
                 self.assert_denied(self.fs.setattr(ino, attr, fields, fh, None))
         with open(os.path.join(self.source, ".git/config"), "rb") as f:
@@ -402,10 +397,18 @@ class PathWritePolicyTests(unittest.TestCase):
             "unlink": lambda: self.fs.unlink(git, b"config", None),
             "rmdir": lambda: self.fs.rmdir(git, b"objects", None),
             "remove root": lambda: self.fs.rmdir(self.root, b".git", None),
-            "rename out": lambda: self.fs.rename(git, b"config", self.root, b"moved", 0, None),
-            "rename in": lambda: self.fs.rename(self.root, b"work.txt", git, b"new", 0, None),
-            "rename root": lambda: self.fs.rename(self.root, b".git", self.root, b"moved", 0, None),
-            "replace root": lambda: self.fs.rename(self.root, b"work.txt", self.root, b".git", 0, None),
+            "rename out": lambda: self.fs.rename(
+                git, b"config", self.root, b"moved", 0, None
+            ),
+            "rename in": lambda: self.fs.rename(
+                self.root, b"work.txt", git, b"new", 0, None
+            ),
+            "rename root": lambda: self.fs.rename(
+                self.root, b".git", self.root, b"moved", 0, None
+            ),
+            "replace root": lambda: self.fs.rename(
+                self.root, b"work.txt", self.root, b".git", 0, None
+            ),
         }
         for name, operation in operations.items():
             with self.subTest(operation=name):
@@ -417,16 +420,18 @@ class PathWritePolicyTests(unittest.TestCase):
     def test_file_rule_cannot_be_bypassed_through_its_writable_parent(self):
         ino = self.lookup("work.txt")
         self.fs.add_readonly("/project", "work.txt")
-        self.assert_denied(self.fs.create(
-            self.root, b"work.txt", 0o644, os.O_WRONLY | os.O_TRUNC, None
-        ))
+        self.assert_denied(
+            self.fs.create(
+                self.root, b"work.txt", 0o644, os.O_WRONLY | os.O_TRUNC, None
+            )
+        )
         self.assert_denied(self.fs.unlink(self.root, b"work.txt", None))
-        self.assert_denied(self.fs.rename(
-            self.root, b"work.txt", self.root, b"moved", 0, None
-        ))
-        self.assert_denied(self.fs.rename(
-            self.root, b".git-backup", self.root, b"work.txt", 0, None
-        ))
+        self.assert_denied(
+            self.fs.rename(self.root, b"work.txt", self.root, b"moved", 0, None)
+        )
+        self.assert_denied(
+            self.fs.rename(self.root, b".git-backup", self.root, b"work.txt", 0, None)
+        )
         self.assert_denied(self.fs.link(ino, self.root, b"alias", None))
 
         # Rules stay anchored even if the host removes the protected path.
@@ -445,19 +450,17 @@ class PathWritePolicyTests(unittest.TestCase):
         os.mkdir(os.path.join(self.source, "parent", "protected"))
         os.mkdir(os.path.join(self.source, "replacement"))
         self.fs.add_readonly("/project", "parent/protected")
-        self.assert_denied(self.fs.rename(
-            self.root, b"parent", self.root, b"moved", 0, None
-        ))
-        self.assert_denied(self.fs.rename(
-            self.root, b"replacement", self.root, b"parent", 0, None
-        ))
+        self.assert_denied(
+            self.fs.rename(self.root, b"parent", self.root, b"moved", 0, None)
+        )
+        self.assert_denied(
+            self.fs.rename(self.root, b"replacement", self.root, b"parent", 0, None)
+        )
 
     def test_writable_directory_rename_keeps_cached_descendants_under_policy(self):
         ino = self.lookup(".git/objects/data")
         fh = self.open_handle(ino)
-        asyncio.run(self.fs.rename(
-            self.root, b".git", self.root, b"moved", 0, None
-        ))
+        asyncio.run(self.fs.rename(self.root, b".git", self.root, b"moved", 0, None))
         self.assertEqual(self.lookup("moved/objects/data"), ino)
         self.fs.add_readonly("/project", "moved")
         self.assert_denied(self.fs.write(fh, 0, b"blocked"))
@@ -467,7 +470,9 @@ class PathWritePolicyTests(unittest.TestCase):
         self.fs.add_readonly("/project", ".git")
         self.fs.add_writable("/project", ".git/config")
         self.open_handle(self.lookup(".git/config"))
-        self.assert_denied(self.fs.open(self.lookup(".git/objects/data"), os.O_RDWR, None))
+        self.assert_denied(
+            self.fs.open(self.lookup(".git/objects/data"), os.O_RDWR, None)
+        )
         self.fs.add_readonly("/project", ".git")
         self.open_handle(self.lookup(".git/config"))
         self.fs.add_readonly("/project", ".git/config")
@@ -483,22 +488,40 @@ class PathWritePolicyTests(unittest.TestCase):
             ino = self.lookup(".git/config", root=root)
             for action in ("writable", "readonly", "writable", "readonly"):
                 with self.subTest(default=default, action=action):
-                    result = self.control._dispatch({
-                        "action": action, "mount": target, "path": "./.git//config/",
-                    })
+                    result = self.control._dispatch(
+                        {
+                            "action": action,
+                            "mount": target,
+                            "path": "./.git//config/",
+                        }
+                    )
                     self.assertTrue(result["ok"])
-                    state = next(m for m in self.fs.list_mounts() if m["target"] == target)
+                    state = next(
+                        m for m in self.fs.list_mounts() if m["target"] == target
+                    )
                     writable = action == "writable"
-                    self.assertEqual(bool(asyncio.run(self.fs.getattr(ino)).st_mode & 0o222), writable)
-                    self.assertEqual(state.get("readwrite", []), [".git/config"] if writable else [])
-                    self.assertEqual(state.get("readonly", []), [] if writable else [".git/config"])
+                    self.assertEqual(
+                        bool(asyncio.run(self.fs.getattr(ino)).st_mode & 0o222),
+                        writable,
+                    )
+                    self.assertEqual(
+                        state.get("readwrite", []), [".git/config"] if writable else []
+                    )
+                    self.assertEqual(
+                        state.get("readonly", []), [] if writable else [".git/config"]
+                    )
                     if writable:
                         fh = self.open_handle(ino)
-                        self.assertEqual(asyncio.run(self.fs.write(fh, 0, b"allowed!")), 8)
+                        self.assertEqual(
+                            asyncio.run(self.fs.write(fh, 0, b"allowed!")), 8
+                        )
                     else:
                         self.assert_denied(self.fs.open(ino, os.O_RDWR, None))
                     sibling = self.lookup(".git-backup", root=root)
-                    self.assertEqual(bool(asyncio.run(self.fs.getattr(sibling)).st_mode & 0o222), default)
+                    self.assertEqual(
+                        bool(asyncio.run(self.fs.getattr(sibling)).st_mode & 0o222),
+                        default,
+                    )
 
     def test_writable_subtree_on_readonly_mount_allows_mutations_inside_only(self):
         self.fs.add_mount(self.source, "/ro")
@@ -526,7 +549,9 @@ class PathWritePolicyTests(unittest.TestCase):
         asyncio.run(self.fs.rmdir(git, b"directory", None))
 
         self.assert_denied(self.fs.create(ro, b"outside", 0o644, os.O_RDWR, None))
-        self.assert_denied(self.fs.open(self.lookup("work.txt", root=ro), os.O_RDWR, None))
+        self.assert_denied(
+            self.fs.open(self.lookup("work.txt", root=ro), os.O_RDWR, None)
+        )
         self.assert_denied(self.fs.rename(ro, b".git", ro, b"moved", 0, None))
         self.assert_denied(self.fs.rmdir(ro, b".git", None))
         self.assertFalse(asyncio.run(self.fs.getattr(ro)).st_mode & 0o222)
@@ -540,11 +565,15 @@ class PathWritePolicyTests(unittest.TestCase):
         self.fs.add_writable("/ro", "work.txt")
         fh = self.open_handle(ino)
         self.assertEqual(asyncio.run(self.fs.write(fh, 0, b"allowed!")), 8)
-        fields = types.SimpleNamespace(**{
-            "update_" + name: name == "size"
-            for name in ("size", "mode", "uid", "gid", "atime", "mtime")
-        })
-        asyncio.run(self.fs.setattr(ino, types.SimpleNamespace(st_size=1), fields, fh, None))
+        fields = types.SimpleNamespace(
+            **{
+                "update_" + name: name == "size"
+                for name in ("size", "mode", "uid", "gid", "atime", "mtime")
+            }
+        )
+        asyncio.run(
+            self.fs.setattr(ino, types.SimpleNamespace(st_size=1), fields, fh, None)
+        )
         self.assertEqual(asyncio.run(self.fs.getattr(ino)).st_size, 1)
         self.assert_denied(self.fs.unlink(ro, b"work.txt", None))
         self.assert_denied(self.fs.rename(ro, b"work.txt", ro, b"moved", 0, None))
@@ -560,13 +589,22 @@ class PathWritePolicyTests(unittest.TestCase):
         self.open_handle(data)
         self.fs.add_readonly("/ro", ".git")
         self.open_handle(data)
-        self.assert_denied(self.fs.open(self.lookup(".git/config", root=ro), os.O_RDWR, None))
+        self.assert_denied(
+            self.fs.open(self.lookup(".git/config", root=ro), os.O_RDWR, None)
+        )
         self.fs.add_writable("/ro", ".git")
         objects = self.lookup(".git/objects", root=ro)
         self.assert_denied(self.fs.mkdir(objects, b"new", 0o755, None))
-        self.assert_denied(self.fs.rename(
-            self.lookup(".git", root=ro), b"objects", self.lookup(".git", root=ro), b"moved", 0, None
-        ))
+        self.assert_denied(
+            self.fs.rename(
+                self.lookup(".git", root=ro),
+                b"objects",
+                self.lookup(".git", root=ro),
+                b"moved",
+                0,
+                None,
+            )
+        )
         self.open_handle(data)
 
     def test_same_source_mounts_keep_independent_readonly_rules(self):
@@ -605,9 +643,14 @@ class PathWritePolicyTests(unittest.TestCase):
         original = self.fs.list_mounts()
         os.unlink(os.path.join(self.source, "work.txt"))
         for policy in ("readonly", "writable"):
-            result = self.control._dispatch({
-                "action": "unhide", "mount": "/project", "path": "work.txt", policy: True,
-            })
+            result = self.control._dispatch(
+                {
+                    "action": "unhide",
+                    "mount": "/project",
+                    "path": "work.txt",
+                    policy: True,
+                }
+            )
             self.assertFalse(result["ok"])
             self.assertEqual(self.fs.list_mounts(), original)
 
@@ -621,9 +664,14 @@ class PathWritePolicyTests(unittest.TestCase):
             self.open_handle(self.lookup(".git/config", root=ro))
 
         self.inodes.side_effect = invalidate
-        result = self.control._dispatch({
-            "action": "unhide", "mount": "/ro", "path": ".git", "writable": True,
-        })
+        result = self.control._dispatch(
+            {
+                "action": "unhide",
+                "mount": "/ro",
+                "path": ".git",
+                "writable": True,
+            }
+        )
         self.assertTrue(result["ok"])
         self.entries.assert_any_call(ro, b".git")
         self.fs.add_hide("/ro", ".git")
@@ -633,15 +681,23 @@ class PathWritePolicyTests(unittest.TestCase):
     def test_cache_notification_failure_reports_error_but_keeps_rule_enforced(self):
         ino = self.lookup("work.txt")
         self.inodes.side_effect = OSError(errno.EIO, "notification failed")
-        result = self.control._dispatch({
-            "action": "readonly", "mount": "/project", "path": "work.txt",
-        })
+        result = self.control._dispatch(
+            {
+                "action": "readonly",
+                "mount": "/project",
+                "path": "work.txt",
+            }
+        )
         self.assertFalse(result["ok"])
         self.assertIn("policy updated", result["error"])
         self.assert_denied(self.fs.open(ino, os.O_RDWR, None))
-        result = self.control._dispatch({
-            "action": "writable", "mount": "/project", "path": "work.txt",
-        })
+        result = self.control._dispatch(
+            {
+                "action": "writable",
+                "mount": "/project",
+                "path": "work.txt",
+            }
+        )
         self.assertFalse(result["ok"])
         self.assertIn("policy updated", result["error"])
         self.open_handle(ino)
@@ -649,23 +705,45 @@ class PathWritePolicyTests(unittest.TestCase):
     def test_invalid_rules_are_rejected_without_changing_state(self):
         original = self.fs.list_mounts()
         for action in ("readonly", "writable"):
-            for path in ("", ".", "../work.txt", ".git/../work.txt", "\0", 123, "missing"):
+            for path in (
+                "",
+                ".",
+                "../work.txt",
+                ".git/../work.txt",
+                "\0",
+                123,
+                "missing",
+            ):
                 with self.subTest(action=action, path=path):
-                    result = self.control._dispatch({
-                        "action": action, "mount": "/project", "path": path,
-                    })
+                    result = self.control._dispatch(
+                        {
+                            "action": action,
+                            "mount": "/project",
+                            "path": path,
+                        }
+                    )
                     self.assertFalse(result["ok"])
                     self.assertEqual(self.fs.list_mounts(), original)
             for value in ("true", 1, None):
-                result = self.control._dispatch({
-                    "action": "unhide", "mount": "/project", "path": "work.txt", action: value,
-                })
+                result = self.control._dispatch(
+                    {
+                        "action": "unhide",
+                        "mount": "/project",
+                        "path": "work.txt",
+                        action: value,
+                    }
+                )
                 self.assertFalse(result["ok"])
                 self.assertEqual(self.fs.list_mounts(), original)
-        result = self.control._dispatch({
-            "action": "unhide", "mount": "/project", "path": "work.txt",
-            "readonly": True, "writable": True,
-        })
+        result = self.control._dispatch(
+            {
+                "action": "unhide",
+                "mount": "/project",
+                "path": "work.txt",
+                "readonly": True,
+                "writable": True,
+            }
+        )
         self.assertFalse(result["ok"])
         self.assertEqual(self.fs.list_mounts(), original)
 
@@ -676,9 +754,20 @@ class PathWritePolicyTests(unittest.TestCase):
 
         def cli(*args):
             output = io.StringIO()
-            with mock.patch.object(sys, "argv", [
-                "sandbox_fs.py", args[0], "-s", self.control._path, *args[1:],
-            ]), mock.patch.object(sys, "stdout", output):
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "sandbox_fs.py",
+                        args[0],
+                        "-s",
+                        self.control._path,
+                        *args[1:],
+                    ],
+                ),
+                mock.patch.object(sys, "stdout", output),
+            ):
                 main()
             return output.getvalue()
 
@@ -705,9 +794,20 @@ class PathWritePolicyTests(unittest.TestCase):
 
         def cli(*args):
             output = io.StringIO()
-            with mock.patch.object(sys, "argv", [
-                "sandbox_fs.py", args[0], "-s", self.control._path, *args[1:],
-            ]), mock.patch.object(sys, "stdout", output):
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "sandbox_fs.py",
+                        args[0],
+                        "-s",
+                        self.control._path,
+                        *args[1:],
+                    ],
+                ),
+                mock.patch.object(sys, "stdout", output),
+            ):
                 main()
             return output.getvalue()
 
@@ -724,7 +824,9 @@ class PathWritePolicyTests(unittest.TestCase):
         ro = self.fs._mounts["/reference"]["inode"]
         self.assertFalse(asyncio.run(self.fs.getattr(ro)).st_mode & 0o222)
         self.open_handle(self.lookup(".git/objects/data", root=ro))
-        self.assert_denied(self.fs.open(self.lookup(".git/config", root=ro), os.O_RDWR, None))
+        self.assert_denied(
+            self.fs.open(self.lookup(".git/config", root=ro), os.O_RDWR, None)
+        )
         self.assertIn("Unchanged: /reference", cli("load", state_path))
         self.assertIn("readwrite: .git", cli("list"))
 
@@ -733,29 +835,65 @@ class PathWritePolicyTests(unittest.TestCase):
         for key in ("readonly", "readwrite"):
             for paths in (".git", None, [1], [".."], ["."]):
                 with self.subTest(key=key, paths=paths), self.assertRaises(ValueError):
-                    self.fs.load_mounts([{
-                        **original[0], key: paths,
-                    }], replace=True)
+                    self.fs.load_mounts(
+                        [
+                            {
+                                **original[0],
+                                key: paths,
+                            }
+                        ],
+                        replace=True,
+                    )
                 self.assertEqual(self.fs.list_mounts(), original)
-            result = self.fs.load_mounts([{
-                **original[0], key: ["missing"],
-            }], replace=True)
+            result = self.fs.load_mounts(
+                [
+                    {
+                        **original[0],
+                        key: ["missing"],
+                    }
+                ],
+                replace=True,
+            )
             self.assertTrue(result["failed"])
             self.assertEqual(self.fs.list_mounts(), original)
-        with self.assertRaisesRegex(ValueError, "Conflicting read-only and writable rules"):
-            self.fs.load_mounts([{
-                **original[0], "readonly": [".git"], "readwrite": ["./.git/"],
-            }], replace=True)
+        with self.assertRaisesRegex(
+            ValueError, "Conflicting read-only and writable rules"
+        ):
+            self.fs.load_mounts(
+                [
+                    {
+                        **original[0],
+                        "readonly": [".git"],
+                        "readwrite": ["./.git/"],
+                    }
+                ],
+                replace=True,
+            )
         self.assertEqual(self.fs.list_mounts(), original)
 
     def test_initial_daemon_rule_is_installed_before_fuse_starts(self):
         with (
-            mock.patch.object(sys, "argv", [
-                "sandbox_fs.py", "daemon", "/unused", "--rw-mount", f"{self.source}:/project",
-                "--readonly", "/project:.git", "--readonly", "/project:work.txt",
-                "--ro-mount", f"{self.source}:/reference", "--writable", "/reference:.git",
-                "--readonly", "/reference:.git/config",
-            ]),
+            mock.patch.object(
+                sys,
+                "argv",
+                [
+                    "sandbox_fs.py",
+                    "daemon",
+                    "/unused",
+                    "--rw-mount",
+                    f"{self.source}:/project",
+                    "--readonly",
+                    "/project:.git",
+                    "--readonly",
+                    "/project:work.txt",
+                    "--ro-mount",
+                    f"{self.source}:/reference",
+                    "--writable",
+                    "/reference:.git",
+                    "--readonly",
+                    "/reference:.git/config",
+                ],
+            ),
             mock.patch.object(pyfuse3, "init", create=True) as init,
             mock.patch.object(pyfuse3, "main", create=True),
             mock.patch.object(pyfuse3, "close", create=True),
@@ -781,8 +919,16 @@ class PathWritePolicyTests(unittest.TestCase):
     def test_cli_rejects_conflicting_unhide_flags_and_initial_rules(self):
         for args in (
             ["unhide", "-s", "/unused", "/project", ".git", "--readonly", "--writable"],
-            ["daemon", "/unused", "--ro-mount", f"{self.source}:/project",
-             "--readonly", "/project:.git", "--writable", "/project:./.git/"],
+            [
+                "daemon",
+                "/unused",
+                "--ro-mount",
+                f"{self.source}:/project",
+                "--readonly",
+                "/project:.git",
+                "--writable",
+                "/project:./.git/",
+            ],
         ):
             with (
                 self.subTest(args=args),
@@ -811,9 +957,7 @@ class CacheControlTests(unittest.TestCase):
         self.fs = SandboxFS(entry_timeout=300, attr_timeout=300)
         self.fs.add_mount(self.source, "/parent/mount", writable=True)
         self.mount_ino = self.fs._mounts["/parent/mount"]["inode"]
-        self.file_ino = asyncio.run(self.fs.lookup(
-            self.mount_ino, b"file.txt"
-        )).st_ino
+        self.file_ino = asyncio.run(self.fs.lookup(self.mount_ino, b"file.txt")).st_ino
         self.control = ControlServer(
             self.fs, os.path.join(self.temp_dir.name, "control.sock")
         )
@@ -835,8 +979,9 @@ class CacheControlTests(unittest.TestCase):
             observed_timeouts.append(self.fs.get_timeouts())
 
         with (
-            mock.patch.object(pyfuse3, "invalidate_inode",
-                              side_effect=invalidate_inode) as invalidate,
+            mock.patch.object(
+                pyfuse3, "invalidate_inode", side_effect=invalidate_inode
+            ) as invalidate,
             mock.patch.object(pyfuse3, "invalidate_entry") as entries,
         ):
             result = self.fs.set_timeouts(attr_timeout=0.25)
@@ -859,18 +1004,25 @@ class CacheControlTests(unittest.TestCase):
 
     def test_invalid_update_leaves_both_timeouts_unchanged(self):
         for invalid in (-1, float("nan"), float("inf"), True, None, "bad"):
-            with self.subTest(value=invalid), mock.patch.object(
-                pyfuse3, "invalidate_inode"
-            ) as invalidate:
-                result = self.control._dispatch({
-                    "action": "timeouts",
-                    "entry_timeout": 1,
-                    "attr_timeout": invalid,
-                })
+            with (
+                self.subTest(value=invalid),
+                mock.patch.object(pyfuse3, "invalidate_inode") as invalidate,
+            ):
+                result = self.control._dispatch(
+                    {
+                        "action": "timeouts",
+                        "entry_timeout": 1,
+                        "attr_timeout": invalid,
+                    }
+                )
                 self.assertFalse(result["ok"])
-                self.assertEqual(self.fs.get_timeouts(), {
-                    "entry_timeout": 300, "attr_timeout": 300,
-                })
+                self.assertEqual(
+                    self.fs.get_timeouts(),
+                    {
+                        "entry_timeout": 300,
+                        "attr_timeout": 300,
+                    },
+                )
                 invalidate.assert_not_called()
 
     def test_query_does_not_invalidate_cache(self):
@@ -888,13 +1040,17 @@ class CacheControlTests(unittest.TestCase):
                 raise OSError(errno.EIO, "notification failed")
 
         with (
-            mock.patch.object(pyfuse3, "invalidate_inode",
-                              side_effect=invalidate_inode),
+            mock.patch.object(
+                pyfuse3, "invalidate_inode", side_effect=invalidate_inode
+            ),
             mock.patch.object(pyfuse3, "invalidate_entry") as entries,
         ):
-            result = self.control._dispatch({
-                "action": "timeouts", "attr_timeout": 0,
-            })
+            result = self.control._dispatch(
+                {
+                    "action": "timeouts",
+                    "attr_timeout": 0,
+                }
+            )
 
         self.assertFalse(result["ok"])
         self.assertEqual(len(result["failed"]), 1)
@@ -906,8 +1062,11 @@ class CacheControlTests(unittest.TestCase):
     def test_invalidation_reports_directory_notification_failures(self):
         with (
             mock.patch.object(pyfuse3, "invalidate_inode"),
-            mock.patch.object(pyfuse3, "invalidate_entry",
-                              side_effect=OSError(errno.ENOSYS, "unsupported")),
+            mock.patch.object(
+                pyfuse3,
+                "invalidate_entry",
+                side_effect=OSError(errno.ENOSYS, "unsupported"),
+            ),
         ):
             result = self.fs.invalidate_cache()
         self.assertFalse(result["ok"])
@@ -930,8 +1089,9 @@ class CacheControlTests(unittest.TestCase):
             replies.append((name, attr, next_id))
             return True
 
-        with mock.patch.object(pyfuse3, "readdir_reply", side_effect=reply,
-                               create=True):
+        with mock.patch.object(
+            pyfuse3, "readdir_reply", side_effect=reply, create=True
+        ):
             asyncio.run(self.fs.readdir(fh, 0, object()))
             os.unlink(self.file_path)
             asyncio.run(self.fs.readdir(fh, 0, object()))
@@ -954,15 +1114,29 @@ class CacheControlTests(unittest.TestCase):
         ):
             for command, options, expected in (
                 ("timeouts", [], "Entry timeout: 300 seconds"),
-                ("timeouts", ["--entry-timeout", "0", "--attr-timeout", "1"],
-                 "Attribute timeout: 1 seconds"),
+                (
+                    "timeouts",
+                    ["--entry-timeout", "0", "--attr-timeout", "1"],
+                    "Attribute timeout: 1 seconds",
+                ),
                 ("invalidate-cache", [], "Invalidated:"),
                 ("timeouts", [], "Entry timeout: 0 seconds"),
             ):
                 output = io.StringIO()
-                with mock.patch.object(sys, "argv", [
-                    "sandbox_fs.py", command, "-s", self.control._path, *options,
-                ]), mock.patch.object(sys, "stdout", output):
+                with (
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "sandbox_fs.py",
+                            command,
+                            "-s",
+                            self.control._path,
+                            *options,
+                        ],
+                    ),
+                    mock.patch.object(sys, "stdout", output),
+                ):
                     main()
                 self.assertIn(expected, output.getvalue())
             inodes.assert_any_call(self.file_ino)
@@ -974,9 +1148,17 @@ class CacheControlTests(unittest.TestCase):
                 args = ["/unused"] if command == "daemon" else ["-s", "/unused"]
                 with (
                     self.subTest(command=command, value=value),
-                    mock.patch.object(sys, "argv", [
-                        "sandbox_fs.py", command, *args, "--attr-timeout", value,
-                    ]),
+                    mock.patch.object(
+                        sys,
+                        "argv",
+                        [
+                            "sandbox_fs.py",
+                            command,
+                            *args,
+                            "--attr-timeout",
+                            value,
+                        ],
+                    ),
                     mock.patch.object(sys, "stderr", io.StringIO()),
                     self.assertRaises(SystemExit) as raised,
                 ):

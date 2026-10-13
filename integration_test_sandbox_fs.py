@@ -18,7 +18,6 @@ import time
 import unittest
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).with_name("sandbox_fs.py")
 
 
@@ -29,9 +28,7 @@ class FuseIntegrationTests(unittest.TestCase):
             raise unittest.SkipTest("FUSE integration requires POSIX")
 
         fuse_device = Path("/dev/fuse")
-        if not fuse_device.exists() or not os.access(
-            fuse_device, os.R_OK | os.W_OK
-        ):
+        if not fuse_device.exists() or not os.access(fuse_device, os.R_OK | os.W_OK):
             raise unittest.SkipTest("an accessible /dev/fuse is required")
 
         cls.fusermount = shutil.which("fusermount3")
@@ -64,9 +61,7 @@ class FuseIntegrationTests(unittest.TestCase):
         (self.source_rw / "editable.txt").write_text(
             "original data\n", encoding="utf-8"
         )
-        (self.source_rw / "secret.txt").write_text(
-            "hidden data\n", encoding="utf-8"
-        )
+        (self.source_rw / "secret.txt").write_text("hidden data\n", encoding="utf-8")
 
         self.process = None
         self.addCleanup(self._cleanup_daemon)
@@ -161,16 +156,21 @@ class FuseIntegrationTests(unittest.TestCase):
 
     def _configure_and_save(self):
         self._cli(
-            "mount", "-s", self.socket_path,
-            self.source_ro, "/readonly",
+            "mount",
+            "-s",
+            self.socket_path,
+            self.source_ro,
+            "/readonly",
         )
         self._cli(
-            "mount", "-s", self.socket_path, "-w",
-            self.source_rw, "/writable",
+            "mount",
+            "-s",
+            self.socket_path,
+            "-w",
+            self.source_rw,
+            "/writable",
         )
-        self._cli(
-            "hide", "-s", self.socket_path, "/writable", "secret.txt"
-        )
+        self._cli("hide", "-s", self.socket_path, "/writable", "secret.txt")
         self._cli("save", "-s", self.socket_path, self.state_path)
 
     def _assert_read_only(self, path):
@@ -203,9 +203,7 @@ class FuseIntegrationTests(unittest.TestCase):
             self._cli("list", "-s", self.socket_path).stdout,
         )
 
-        loaded = self._cli(
-            "load", "-s", self.socket_path, self.state_path
-        )
+        loaded = self._cli("load", "-s", self.socket_path, self.state_path)
         self.assertIn("Loaded: /readonly", loaded.stdout)
         self.assertIn("Loaded: /writable", loaded.stdout)
         self.assertEqual(
@@ -214,9 +212,7 @@ class FuseIntegrationTests(unittest.TestCase):
         )
         self.assertFalse((root / "writable/secret.txt").exists())
 
-        repeated = self._cli(
-            "load", "-s", self.socket_path, self.state_path
-        )
+        repeated = self._cli("load", "-s", self.socket_path, self.state_path)
         self.assertIn("Unchanged: /readonly", repeated.stdout)
         self.assertIn("Unchanged: /writable", repeated.stdout)
 
@@ -231,8 +227,12 @@ class FuseIntegrationTests(unittest.TestCase):
         )
         self._cli("unmount", "-s", self.socket_path, "/readonly")
         self._cli(
-            "mount", "-s", self.socket_path, "-w",
-            self.source_rw, "/readonly",
+            "mount",
+            "-s",
+            self.socket_path,
+            "-w",
+            self.source_rw,
+            "/readonly",
         )
         conflicting_file = root / "readonly/editable.txt"
         self.assertEqual(
@@ -251,9 +251,7 @@ class FuseIntegrationTests(unittest.TestCase):
             "conflicting data\n",
         )
 
-        forced = self._cli(
-            "load", "-s", self.socket_path, "--force", self.state_path
-        )
+        forced = self._cli("load", "-s", self.socket_path, "--force", self.state_path)
         self.assertIn("Loaded: /readonly", forced.stdout)
         self.assertEqual(
             (root / "readonly/reference.txt").read_text(encoding="utf-8"),
@@ -262,9 +260,7 @@ class FuseIntegrationTests(unittest.TestCase):
         self.assertFalse((root / "readonly/editable.txt").exists())
         self._assert_read_only(root / "readonly/blocked.txt")
 
-        self._cli(
-            "mount", "-s", self.socket_path, self.source_rw, "/extra"
-        )
+        self._cli("mount", "-s", self.socket_path, self.source_rw, "/extra")
         self.assertEqual(
             (root / "extra/editable.txt").read_text(encoding="utf-8"),
             "conflicting data\n",
@@ -277,24 +273,24 @@ class FuseIntegrationTests(unittest.TestCase):
 
     def test_runtime_hide_and_unhide_refresh_kernel_entries(self):
         self._cli(
-            "mount", "-s", self.socket_path, "-w",
-            self.source_rw, "/writable",
+            "mount",
+            "-s",
+            self.socket_path,
+            "-w",
+            self.source_rw,
+            "/writable",
         )
         secret = self.mountpoint / "writable/secret.txt"
 
         self.assertEqual(secret.read_text(encoding="utf-8"), "hidden data\n")
-        self._cli(
-            "hide", "-s", self.socket_path, "/writable", "secret.txt"
-        )
+        self._cli("hide", "-s", self.socket_path, "/writable", "secret.txt")
         self.assertFalse(secret.exists())
         self.assertNotIn(
             "secret.txt",
             {entry.name for entry in secret.parent.iterdir()},
         )
 
-        self._cli(
-            "unhide", "-s", self.socket_path, "/writable", "secret.txt"
-        )
+        self._cli("unhide", "-s", self.socket_path, "/writable", "secret.txt")
         self.assertEqual(secret.read_text(encoding="utf-8"), "hidden data\n")
 
     def test_runtime_timeouts_replace_long_lived_cached_attributes(self):
@@ -304,8 +300,13 @@ class FuseIntegrationTests(unittest.TestCase):
         self._cli("mount", "-s", self.socket_path, self.source_rw, "/shared")
         shared = self.mountpoint / "shared/editable.txt"
         self._cli(
-            "timeouts", "-s", self.socket_path,
-            "--entry-timeout", "300", "--attr-timeout", "300",
+            "timeouts",
+            "-s",
+            self.socket_path,
+            "--entry-timeout",
+            "300",
+            "--attr-timeout",
+            "300",
         )
         self.assertEqual(shared.stat().st_size, len("original data\n"))
         updated = "longer externally updated contents\n"
@@ -314,7 +315,11 @@ class FuseIntegrationTests(unittest.TestCase):
         self.assertEqual(shared.stat().st_size, len("original data\n"))
 
         changed = self._cli(
-            "timeouts", "-s", self.socket_path, "--attr-timeout", "0",
+            "timeouts",
+            "-s",
+            self.socket_path,
+            "--attr-timeout",
+            "0",
         )
         self.assertIn("Entry timeout: 300 seconds", changed.stdout)
         self.assertEqual(shared.stat().st_size, len(updated))
@@ -329,11 +334,21 @@ class FuseIntegrationTests(unittest.TestCase):
         (git_source / "config").write_text("original", encoding="utf-8")
         (git_source / "objects").mkdir()
         self._cli(
-            "mount", "-s", self.socket_path, "-w", self.source_rw, "/project",
+            "mount",
+            "-s",
+            self.socket_path,
+            "-w",
+            self.source_rw,
+            "/project",
         )
         self._cli(
-            "timeouts", "-s", self.socket_path,
-            "--entry-timeout", "300", "--attr-timeout", "300",
+            "timeouts",
+            "-s",
+            self.socket_path,
+            "--entry-timeout",
+            "300",
+            "--attr-timeout",
+            "300",
         )
         project = self.mountpoint / "project"
         git = project / ".git"
@@ -363,24 +378,38 @@ class FuseIntegrationTests(unittest.TestCase):
                 self.assertIn(raised.exception.errno, (errno.EACCES, errno.EROFS))
             self._assert_read_only(git / "new.txt")
             (project / "editable.txt").write_text("editable", encoding="utf-8")
-            self.assertEqual((git_source / "config").read_text(encoding="utf-8"), "original")
+            self.assertEqual(
+                (git_source / "config").read_text(encoding="utf-8"), "original"
+            )
 
             self._cli("writable", "-s", self.socket_path, "/project", ".git")
             self.assertTrue(config.stat().st_mode & 0o222)
             writer.seek(0)
             self.assertEqual(writer.write(b"allowed!"), 8)
-        self.assertEqual((git_source / "config").read_text(encoding="utf-8"), "allowed!")
+        self.assertEqual(
+            (git_source / "config").read_text(encoding="utf-8"), "allowed!"
+        )
 
     def test_unhide_readonly_and_save_restart_load(self):
         self._cli(
-            "mount", "-s", self.socket_path, "-w", self.source_rw, "/project",
+            "mount",
+            "-s",
+            self.socket_path,
+            "-w",
+            self.source_rw,
+            "/project",
         )
         secret = self.mountpoint / "project/secret.txt"
         self._cli("hide", "-s", self.socket_path, "/project", "secret.txt")
         # Establish a negative lookup before unhiding a never-allocated inode.
         self.assertFalse(secret.exists())
         self._cli(
-            "unhide", "-s", self.socket_path, "/project", "secret.txt", "--readonly",
+            "unhide",
+            "-s",
+            self.socket_path,
+            "/project",
+            "secret.txt",
+            "--readonly",
         )
         self.assertEqual(secret.read_text(encoding="utf-8"), "hidden data\n")
         self._assert_read_only(secret)
@@ -388,7 +417,9 @@ class FuseIntegrationTests(unittest.TestCase):
         self._stop_daemon()
         self._start_daemon()
         self._cli("load", "-s", self.socket_path, self.state_path)
-        self.assertIn("readonly: secret.txt", self._cli("list", "-s", self.socket_path).stdout)
+        self.assertIn(
+            "readonly: secret.txt", self._cli("list", "-s", self.socket_path).stdout
+        )
         self.assertEqual(secret.read_text(encoding="utf-8"), "hidden data\n")
         self._assert_read_only(secret)
         with self.assertRaises(OSError) as raised:
@@ -401,8 +432,13 @@ class FuseIntegrationTests(unittest.TestCase):
         (editable_source / "file.txt").write_text("original", encoding="utf-8")
         self._cli("mount", "-s", self.socket_path, self.source_ro, "/reference")
         self._cli(
-            "timeouts", "-s", self.socket_path,
-            "--entry-timeout", "300", "--attr-timeout", "300",
+            "timeouts",
+            "-s",
+            self.socket_path,
+            "--entry-timeout",
+            "300",
+            "--attr-timeout",
+            "300",
         )
         reference = self.mountpoint / "reference"
         editable = reference / "editable"
@@ -430,12 +466,16 @@ class FuseIntegrationTests(unittest.TestCase):
 
         with open(file_path, "r+b", buffering=0) as writer:
             self.assertEqual(writer.write(b"allowed!"), 8)
-            self._cli("readonly", "-s", self.socket_path, "/reference", "editable/file.txt")
+            self._cli(
+                "readonly", "-s", self.socket_path, "/reference", "editable/file.txt"
+            )
             self.assertFalse(file_path.stat().st_mode & 0o222)
             with self.assertRaises(OSError) as raised:
                 writer.write(b"blocked")
             self.assertIn(raised.exception.errno, (errno.EACCES, errno.EROFS))
-            self._cli("writable", "-s", self.socket_path, "/reference", "editable/file.txt")
+            self._cli(
+                "writable", "-s", self.socket_path, "/reference", "editable/file.txt"
+            )
             self._cli("readonly", "-s", self.socket_path, "/reference", "editable")
             # The child remains writable even after its parent's rule changes.
             self.assertTrue(file_path.stat().st_mode & 0o222)
@@ -445,13 +485,17 @@ class FuseIntegrationTests(unittest.TestCase):
             with self.assertRaises(OSError) as raised:
                 file_path.unlink()
             self.assertIn(raised.exception.errno, (errno.EACCES, errno.EROFS))
-            self._cli("readonly", "-s", self.socket_path, "/reference", "editable/file.txt")
+            self._cli(
+                "readonly", "-s", self.socket_path, "/reference", "editable/file.txt"
+            )
             self._cli("writable", "-s", self.socket_path, "/reference", "editable")
             self._assert_read_only(file_path)
             with self.assertRaises(OSError) as raised:
                 writer.write(b"blocked")
             self.assertIn(raised.exception.errno, (errno.EACCES, errno.EROFS))
-        self.assertEqual((editable_source / "file.txt").read_text(encoding="utf-8"), "child-rw")
+        self.assertEqual(
+            (editable_source / "file.txt").read_text(encoding="utf-8"), "child-rw"
+        )
 
     def test_mixed_write_overrides_survive_save_restart_load(self):
         cache_source = self.source_ro / "cache"
@@ -478,7 +522,10 @@ class FuseIntegrationTests(unittest.TestCase):
         self.assertEqual((cache_source / "new").read_text(encoding="utf-8"), "created")
         self._assert_read_only(cache / "index")
         self._assert_read_only(reference / "reference.txt")
-        self.assertIn("Unchanged: /reference", self._cli("load", "-s", self.socket_path, self.state_path).stdout)
+        self.assertIn(
+            "Unchanged: /reference",
+            self._cli("load", "-s", self.socket_path, self.state_path).stdout,
+        )
 
     def test_unhide_writable_file_inside_readonly_mount(self):
         self._cli("mount", "-s", self.socket_path, self.source_ro, "/reference")
@@ -486,10 +533,17 @@ class FuseIntegrationTests(unittest.TestCase):
         self._cli("hide", "-s", self.socket_path, "/reference", "reference.txt")
         self.assertFalse(file_path.exists())
         self._cli(
-            "unhide", "-s", self.socket_path, "/reference", "reference.txt", "--writable",
+            "unhide",
+            "-s",
+            self.socket_path,
+            "/reference",
+            "reference.txt",
+            "--writable",
         )
         file_path.write_text("writable", encoding="utf-8")
-        self.assertEqual((self.source_ro / "reference.txt").read_text(encoding="utf-8"), "writable")
+        self.assertEqual(
+            (self.source_ro / "reference.txt").read_text(encoding="utf-8"), "writable"
+        )
         self.assertFalse(file_path.parent.stat().st_mode & 0o222)
         self._cli("hide", "-s", self.socket_path, "/reference", "reference.txt")
         self._cli("unhide", "-s", self.socket_path, "/reference", "reference.txt")
@@ -500,8 +554,13 @@ class FuseIntegrationTests(unittest.TestCase):
     def test_invalidate_cache_refreshes_open_file_data_and_directory_entries(self):
         self._cli("mount", "-s", self.socket_path, self.source_rw, "/shared")
         self._cli(
-            "timeouts", "-s", self.socket_path,
-            "--entry-timeout", "300", "--attr-timeout", "300",
+            "timeouts",
+            "-s",
+            self.socket_path,
+            "--entry-timeout",
+            "300",
+            "--attr-timeout",
+            "300",
         )
         shared = self.mountpoint / "shared/editable.txt"
         shared.stat()

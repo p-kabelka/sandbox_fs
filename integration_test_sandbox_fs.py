@@ -323,6 +323,180 @@ class FuseIntegrationTests(unittest.TestCase):
         (self.source_rw / "editable.txt").write_text(updated_again, encoding="utf-8")
         self.assertEqual(shared.stat().st_size, len(updated_again))
 
+    def test_readonly_subtree_blocks_cached_open_handles_and_path_mutations(self):
+        git_source = self.source_rw / ".git"
+        git_source.mkdir()
+        (git_source / "config").write_text("original", encoding="utf-8")
+        (git_source / "objects").mkdir()
+        self._cli(
+            "mount", "-s", self.socket_path, "-w", self.source_rw, "/project",
+        )
+        self._cli(
+            "timeouts", "-s", self.socket_path,
+            "--entry-timeout", "300", "--attr-timeout", "300",
+        )
+        project = self.mountpoint / "project"
+        git = project / ".git"
+        config = git / "config"
+        self.assertTrue(config.stat().st_mode & 0o222)
+        with open(config, "r+b", buffering=0) as writer:
+            self._cli("readonly", "-s", self.socket_path, "/project", ".git")
+            self.assertFalse(config.stat().st_mode & 0o222)
+            self.assertFalse(git.stat().st_mode & 0o222)
+            self.assertEqual(writer.read(), b"original")
+            with self.assertRaises(OSError) as raised:
+                writer.write(b"blocked")
+            self.assertIn(raised.exception.errno, (errno.EACCES, errno.EROFS))
+
+            for mutation in (
+                lambda: config.write_text("blocked", encoding="utf-8"),
+                lambda: config.unlink(),
+                lambda: config.chmod(0o777),
+                lambda: (git / "new").mkdir(),
+                lambda: (git / "objects").rmdir(),
+                lambda: git.rename(project / "moved"),
+                lambda: (project / "editable.txt").rename(config),
+                lambda: os.link(config, project / "alias"),
+            ):
+                with self.assertRaises(OSError) as raised:
+                    mutation()
+                self.assertIn(raised.exception.errno, (errno.EACCES, errno.EROFS))
+            self._assert_read_only(git / "new.txt")
+            (project / "editable.txt").write_text("editable", encoding="utf-8")
+            self.assertEqual((git_source / "config").read_text(encoding="utf-8"), "original")
+
+            self._cli("writable", "-s", self.socket_path, "/project", ".git")
+            self.assertTrue(config.stat().st_mode & 0o222)
+            writer.seek(0)
+            self.assertEqual(writer.write(b"allowed!"), 8)
+        self.assertEqual((git_source / "config").read_text(encoding="utf-8"), "allowed!")
+
+    def test_unhide_readonly_and_save_restart_load(self):
+        self._cli(
+            "mount", "-s", self.socket_path, "-w", self.source_rw, "/project",
+        )
+        secret = self.mountpoint / "project/secret.txt"
+        self._cli("hide", "-s", self.socket_path, "/project", "secret.txt")
+        # Establish a negative lookup before unhiding a never-allocated inode.
+        self.assertFalse(secret.exists())
+        self._cli(
+            "unhide", "-s", self.socket_path, "/project", "secret.txt", "--readonly",
+        )
+        self.assertEqual(secret.read_text(encoding="utf-8"), "hidden data\n")
+        self._assert_read_only(secret)
+        self._cli("save", "-s", self.socket_path, self.state_path)
+        self._stop_daemon()
+        self._start_daemon()
+        self._cli("load", "-s", self.socket_path, self.state_path)
+        self.assertIn("readonly: secret.txt", self._cli("list", "-s", self.socket_path).stdout)
+        self.assertEqual(secret.read_text(encoding="utf-8"), "hidden data\n")
+        self._assert_read_only(secret)
+        with self.assertRaises(OSError) as raised:
+            secret.unlink()
+        self.assertIn(raised.exception.errno, (errno.EACCES, errno.EROFS))
+
+    def test_writable_override_on_readonly_mount_and_nested_rules(self):
+        editable_source = self.source_ro / "editable"
+        editable_source.mkdir()
+        (editable_source / "file.txt").write_text("original", encoding="utf-8")
+        self._cli("mount", "-s", self.socket_path, self.source_ro, "/reference")
+        self._cli(
+            "timeouts", "-s", self.socket_path,
+            "--entry-timeout", "300", "--attr-timeout", "300",
+        )
+        reference = self.mountpoint / "reference"
+        editable = reference / "editable"
+        file_path = editable / "file.txt"
+        self.assertFalse(file_path.stat().st_mode & 0o222)
+        self._assert_read_only(file_path)
+        self._cli("writable", "-s", self.socket_path, "/reference", "editable")
+        self.assertTrue(file_path.stat().st_mode & 0o222)
+        self.assertTrue(editable.stat().st_mode & 0o222)
+        self.assertFalse(reference.stat().st_mode & 0o222)
+        self._assert_read_only(reference / "reference.txt")
+        self._assert_read_only(reference / "outside.txt")
+
+        (editable / "created.txt").write_text("created", encoding="utf-8")
+        directory = editable / "directory"
+        directory.mkdir()
+        directory.rmdir()
+        file_path.chmod(0o600)
+        (editable / "symbolic").symlink_to("file.txt")
+        (editable / "symbolic").unlink()
+        os.link(file_path, editable / "hardlink")
+        (editable / "hardlink").unlink()
+        (editable / "created.txt").rename(editable / "renamed.txt")
+        (editable / "renamed.txt").unlink()
+
+        with open(file_path, "r+b", buffering=0) as writer:
+            self.assertEqual(writer.write(b"allowed!"), 8)
+            self._cli("readonly", "-s", self.socket_path, "/reference", "editable/file.txt")
+            self.assertFalse(file_path.stat().st_mode & 0o222)
+            with self.assertRaises(OSError) as raised:
+                writer.write(b"blocked")
+            self.assertIn(raised.exception.errno, (errno.EACCES, errno.EROFS))
+            self._cli("writable", "-s", self.socket_path, "/reference", "editable/file.txt")
+            self._cli("readonly", "-s", self.socket_path, "/reference", "editable")
+            # The child remains writable even after its parent's rule changes.
+            self.assertTrue(file_path.stat().st_mode & 0o222)
+            writer.seek(0)
+            self.assertEqual(writer.write(b"child-rw"), 8)
+            self._assert_read_only(editable / "new.txt")
+            with self.assertRaises(OSError) as raised:
+                file_path.unlink()
+            self.assertIn(raised.exception.errno, (errno.EACCES, errno.EROFS))
+            self._cli("readonly", "-s", self.socket_path, "/reference", "editable/file.txt")
+            self._cli("writable", "-s", self.socket_path, "/reference", "editable")
+            self._assert_read_only(file_path)
+            with self.assertRaises(OSError) as raised:
+                writer.write(b"blocked")
+            self.assertIn(raised.exception.errno, (errno.EACCES, errno.EROFS))
+        self.assertEqual((editable_source / "file.txt").read_text(encoding="utf-8"), "child-rw")
+
+    def test_mixed_write_overrides_survive_save_restart_load(self):
+        cache_source = self.source_ro / "cache"
+        cache_source.mkdir()
+        (cache_source / "index").write_text("index", encoding="utf-8")
+        (cache_source / "data").write_text("data", encoding="utf-8")
+        self._cli("mount", "-s", self.socket_path, self.source_ro, "/reference")
+        self._cli("writable", "-s", self.socket_path, "/reference", "cache")
+        self._cli("readonly", "-s", self.socket_path, "/reference", "cache/index")
+        self._cli("save", "-s", self.socket_path, self.state_path)
+        self._stop_daemon()
+        self._start_daemon()
+        self._cli("load", "-s", self.socket_path, self.state_path)
+
+        listing = self._cli("list", "-s", self.socket_path).stdout
+        self.assertIn("(ro)", listing)
+        self.assertIn("readwrite: cache", listing)
+        self.assertIn("readonly: cache/index", listing)
+        reference = self.mountpoint / "reference"
+        cache = reference / "cache"
+        (cache / "data").write_text("updated", encoding="utf-8")
+        (cache / "new").write_text("created", encoding="utf-8")
+        self.assertEqual((cache_source / "data").read_text(encoding="utf-8"), "updated")
+        self.assertEqual((cache_source / "new").read_text(encoding="utf-8"), "created")
+        self._assert_read_only(cache / "index")
+        self._assert_read_only(reference / "reference.txt")
+        self.assertIn("Unchanged: /reference", self._cli("load", "-s", self.socket_path, self.state_path).stdout)
+
+    def test_unhide_writable_file_inside_readonly_mount(self):
+        self._cli("mount", "-s", self.socket_path, self.source_ro, "/reference")
+        file_path = self.mountpoint / "reference/reference.txt"
+        self._cli("hide", "-s", self.socket_path, "/reference", "reference.txt")
+        self.assertFalse(file_path.exists())
+        self._cli(
+            "unhide", "-s", self.socket_path, "/reference", "reference.txt", "--writable",
+        )
+        file_path.write_text("writable", encoding="utf-8")
+        self.assertEqual((self.source_ro / "reference.txt").read_text(encoding="utf-8"), "writable")
+        self.assertFalse(file_path.parent.stat().st_mode & 0o222)
+        self._cli("hide", "-s", self.socket_path, "/reference", "reference.txt")
+        self._cli("unhide", "-s", self.socket_path, "/reference", "reference.txt")
+        file_path.write_text("still writable", encoding="utf-8")
+        self._cli("readonly", "-s", self.socket_path, "/reference", "reference.txt")
+        self._assert_read_only(file_path)
+
     def test_invalidate_cache_refreshes_open_file_data_and_directory_entries(self):
         self._cli("mount", "-s", self.socket_path, self.source_rw, "/shared")
         self._cli(

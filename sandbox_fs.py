@@ -22,6 +22,16 @@ Usage:
   # Unhide a path
   sandbox_fs.py unhide -s /mnt/sandbox.sock /virtual/mount .secrets
 
+  # Protect a path (and its descendants) within a writable mount
+  sandbox_fs.py readonly -s /mnt/sandbox.sock /virtual/mount .git
+  sandbox_fs.py writable -s /mnt/sandbox.sock /virtual/mount .git
+
+  # Unhide a path with a read-only rule applied atomically
+  sandbox_fs.py unhide -s /mnt/sandbox.sock /virtual/mount .secrets --readonly
+
+  # Grant write access to a path within a read-only mount
+  sandbox_fs.py writable -s /mnt/sandbox.sock /virtual/mount editable
+
   # List current state
   sandbox_fs.py list -s /mnt/sandbox.sock
 
@@ -99,15 +109,35 @@ def _normalize_mount_target(target: str) -> str:
 
 
 def _normalize_hidden_path(rel_path: str) -> str:
+    return _normalize_relative_path(rel_path, "Hidden")
+
+
+def _normalize_readonly_path(rel_path: str) -> str:
+    return _normalize_relative_path(rel_path, "Read-only")
+
+
+def _normalize_writable_path(rel_path: str) -> str:
+    return _normalize_relative_path(rel_path, "Writable")
+
+
+def _check_conflicting_write_rules(readonly, readwrite):
+    conflicts = set(readonly) & set(readwrite)
+    if conflicts:
+        raise ValueError(
+            f"Conflicting read-only and writable rules: {', '.join(sorted(conflicts))}"
+        )
+
+
+def _normalize_relative_path(rel_path: str, kind: str) -> str:
     if not isinstance(rel_path, str):
-        raise ValueError("Hidden path must be a string")
+        raise ValueError(f"{kind} path must be a string")
     parts = PurePosixPath(rel_path.strip("/")).parts
     if not parts:
-        raise ValueError("Hidden path cannot be empty")
+        raise ValueError(f"{kind} path cannot be empty")
     if ".." in parts:
-        raise ValueError(f"Hidden path cannot contain '..': {rel_path}")
+        raise ValueError(f"{kind} path cannot contain '..': {rel_path}")
     if any("\0" in part for part in parts):
-        raise ValueError("Hidden path cannot contain NUL")
+        raise ValueError(f"{kind} path cannot contain NUL")
     return "/".join(parts)
 
 
@@ -179,11 +209,15 @@ class SandboxFS(pyfuse3.Operations):
                 raise pyfuse3.FUSEError(errno.ENOENT)
             if not node.active:
                 raise pyfuse3.FUSEError(errno.ENOENT)
+            if not node.is_virtual:
+                node.writable = self._is_writable(node.mount_target, node.real_path)
             return node
 
     def _alloc(self, real_path: str | None = None,
                mount_target: str | None = None,
                writable: bool = False) -> _Inode:
+        if real_path is not None and mount_target in self._mounts:
+            writable = self._is_writable(mount_target, real_path)
         ino = self._next_ino()
         node = _Inode(
             ino=ino,
@@ -214,6 +248,52 @@ class SandboxFS(pyfuse3.Operations):
             for mount in self._mounts.values()
             for rel_path in mount["hidden"]
         }
+
+    def _is_writable(self, mount_target: str, real_path: str) -> bool:
+        with self._lock:
+            info = self._mounts.get(mount_target)
+            if not info:
+                return False
+            writable = info["writable"]
+            specificity = -1
+            for policy, paths in ((False, info["readonly"]), (True, info["readwrite"])):
+                for path in paths:
+                    rule_path = os.path.join(info["source"], path)
+                    if len(rule_path) > specificity and self._path_contains(
+                        rule_path, real_path
+                    ):
+                        writable = policy
+                        specificity = len(rule_path)
+            return writable
+
+    @staticmethod
+    def _path_contains(parent: str, child: str) -> bool:
+        return child == parent or child.startswith(parent.rstrip("/") + "/")
+
+    def _check_writable(self, node: _Inode):
+        if node.is_virtual or not node.active or not self._is_writable(
+            node.mount_target, node.real_path
+        ):
+            raise pyfuse3.FUSEError(errno.EACCES)
+
+    def _check_path_writable(self, mount_target: str, real_path: str,
+                             protect_descendants: bool = False):
+        if not self._is_writable(mount_target, real_path):
+            raise pyfuse3.FUSEError(errno.EACCES)
+        if protect_descendants:
+            # Moving/removing an ancestor must not move a protected subtree
+            # out from under its path-based rule, or overwrite that subtree.
+            info = self._mounts[mount_target]
+            if any(
+                self._path_contains(real_path, os.path.join(info["source"], path))
+                for path in info["readonly"]
+            ):
+                raise pyfuse3.FUSEError(errno.EACCES)
+
+    def _refresh_writable(self, mount_target: str):
+        for node in self._inodes.values():
+            if node.active and node.mount_target == mount_target:
+                node.writable = self._is_writable(mount_target, node.real_path)
 
     # -- attribute helpers --------------------------------------------------
 
@@ -293,7 +373,7 @@ class SandboxFS(pyfuse3.Operations):
         with self._cache_control_lock:
             return self._invalidate_cache()
 
-    def _invalidate_cache(self) -> dict:
+    def _invalidate_cache(self, extra_entries=()) -> dict:
         with self._lock:
             inodes = list(self._inodes)
             entries = {
@@ -307,6 +387,7 @@ class SandboxFS(pyfuse3.Operations):
                 )
                 if parent_ino is not None:
                     entries.add((parent_ino, os.fsencode(os.path.basename(real_path))))
+            entries.update(extra_entries)
 
         result = {"ok": True, "inodes": 0, "entries": 0, "failed": []}
         # Notifications can wait for FUSE requests. Never hold _lock here:
@@ -337,11 +418,21 @@ class SandboxFS(pyfuse3.Operations):
 
     # -- mount management ---------------------------------------------------
 
-    def add_mount(self, source: str, target: str, writable: bool = False):
+    def add_mount(self, source: str, target: str, writable: bool = False,
+                  readonly: list[str] | None = None,
+                  readwrite: list[str] | None = None):
         source = os.path.realpath(source)
         if not os.path.exists(source):
             raise ValueError(f"Source does not exist: {source}")
         target = _normalize_mount_target(target)
+        readonly_paths = {_normalize_readonly_path(path) for path in (readonly or [])}
+        readwrite_paths = {_normalize_writable_path(path) for path in (readwrite or [])}
+        _check_conflicting_write_rules(readonly_paths, readwrite_paths)
+        for kind, paths in (("Read-only", readonly_paths), ("Writable", readwrite_paths)):
+            for rel_path in paths:
+                abs_path = os.path.join(source, rel_path)
+                if not os.path.lexists(abs_path):
+                    raise ValueError(f"{kind} path does not exist: {abs_path}")
 
         with self._lock:
             if target in self._mounts:
@@ -387,6 +478,8 @@ class SandboxFS(pyfuse3.Operations):
                 "writable": writable,
                 "inode": node.ino,
                 "hidden": set(),
+                "readonly": readonly_paths,
+                "readwrite": readwrite_paths,
             }
 
         # Drop both the cached directory entry and any cached readdir data.
@@ -491,7 +584,14 @@ class SandboxFS(pyfuse3.Operations):
             pass
         log.info("Hidden %s in mount %s", rel_path, mount_target)
 
-    def remove_hide(self, mount_target: str, rel_path: str):
+    def remove_hide(self, mount_target: str, rel_path: str,
+                    readonly: bool = False, writable: bool = False) -> dict:
+        if not isinstance(readonly, bool) or not isinstance(writable, bool):
+            raise ValueError("Read-only and writable options must be boolean values")
+        if readonly and writable:
+            raise ValueError("Read-only and writable options are mutually exclusive")
+        if readonly or writable:
+            return self._set_path_writable(mount_target, rel_path, writable, unhide=True)
         mount_target = _normalize_mount_target(mount_target)
         rel_path = _normalize_hidden_path(rel_path)
 
@@ -522,6 +622,57 @@ class SandboxFS(pyfuse3.Operations):
         except Exception:
             pass
         log.info("Unhidden %s in mount %s", rel_path, mount_target)
+        return {"ok": True}
+
+    def add_readonly(self, mount_target: str, rel_path: str) -> dict:
+        return self._set_path_writable(mount_target, rel_path, False)
+
+    def add_writable(self, mount_target: str, rel_path: str) -> dict:
+        return self._set_path_writable(mount_target, rel_path, True)
+
+    def _set_path_writable(self, mount_target: str, rel_path: str, writable: bool,
+                           unhide: bool = False) -> dict:
+        mount_target = _normalize_mount_target(mount_target)
+        kind = "Writable" if writable else "Read-only"
+        rel_path = _normalize_relative_path(rel_path, kind)
+
+        with self._cache_control_lock:
+            with self._lock:
+                if mount_target not in self._mounts:
+                    raise ValueError(f"Not mounted: {mount_target}")
+                info = self._mounts[mount_target]
+                abs_path = os.path.join(info["source"], rel_path)
+                if not os.path.lexists(abs_path):
+                    raise ValueError(f"{kind} path does not exist: {abs_path}")
+                # The last command at this exact path wins; other, more
+                # specific rules remain in effect beneath it.
+                key, opposite = ("readwrite", "readonly") if writable else (
+                    "readonly", "readwrite"
+                )
+                info[opposite].discard(rel_path)
+                info[key].add(rel_path)
+                if unhide:
+                    info["hidden"].discard(rel_path)
+                    self._rebuild_hidden()
+                self._refresh_writable(mount_target)
+                parent_ino = self._path_to_ino.get(
+                    (mount_target, os.path.dirname(abs_path))
+                )
+                entries = [] if parent_ino is None else [
+                    (parent_ino, os.fsencode(os.path.basename(abs_path)))
+                ]
+
+            # Drop old write bits and cached entries/data. This must run on
+            # the control thread without _lock: FUSE requests may need it.
+            result = self._invalidate_cache(extra_entries=entries)
+            if not result["ok"]:
+                result["error"] = (
+                    "Path write policy updated, but some cache entries "
+                    "could not be invalidated"
+                )
+        log.info("%s rule set for %s in mount %s%s", kind, rel_path, mount_target,
+                 " (unhidden)" if unhide else "")
+        return result
 
     def list_mounts(self) -> list[dict]:
         with self._lock:
@@ -531,6 +682,8 @@ class SandboxFS(pyfuse3.Operations):
                     "target": m["target"],
                     "writable": m["writable"],
                     "hidden": sorted(m["hidden"]),
+                    **({"readonly": sorted(m["readonly"])} if m["readonly"] else {}),
+                    **({"readwrite": sorted(m["readwrite"])} if m["readwrite"] else {}),
                 }
                 for m in self._mounts.values()
             ]
@@ -544,6 +697,8 @@ class SandboxFS(pyfuse3.Operations):
         target = config.get("target")
         writable = config.get("writable", False)
         hidden = config.get("hidden", [])
+        readonly = config.get("readonly", [])
+        readwrite = config.get("readwrite", [])
 
         if not isinstance(source, str) or not source:
             raise ValueError(f"Mount {index} has an invalid source")
@@ -555,12 +710,26 @@ class SandboxFS(pyfuse3.Operations):
             isinstance(path, str) for path in hidden
         ):
             raise ValueError(f"Mount {index} has an invalid hidden list")
+        if not isinstance(readonly, list) or not all(
+            isinstance(path, str) for path in readonly
+        ):
+            raise ValueError(f"Mount {index} has an invalid readonly list")
+        if not isinstance(readwrite, list) or not all(
+            isinstance(path, str) for path in readwrite
+        ):
+            raise ValueError(f"Mount {index} has an invalid readwrite list")
+
+        readonly = sorted({_normalize_readonly_path(path) for path in readonly})
+        readwrite = sorted({_normalize_writable_path(path) for path in readwrite})
+        _check_conflicting_write_rules(readonly, readwrite)
 
         return {
             "source": os.path.realpath(source),
             "target": _normalize_mount_target(target),
             "writable": writable,
             "hidden": sorted({_normalize_hidden_path(path) for path in hidden}),
+            "readonly": readonly,
+            "readwrite": readwrite,
         }
 
     @staticmethod
@@ -569,6 +738,8 @@ class SandboxFS(pyfuse3.Operations):
             current["source"] == desired["source"]
             and current["writable"] == desired["writable"]
             and current["hidden"] == desired["hidden"]
+            and current.get("readonly", []) == desired.get("readonly", [])
+            and current.get("readwrite", []) == desired.get("readwrite", [])
         )
 
     @staticmethod
@@ -587,10 +758,17 @@ class SandboxFS(pyfuse3.Operations):
             abs_path = os.path.join(config["source"], rel_path)
             if not os.path.exists(abs_path):
                 raise ValueError(f"Hidden path does not exist: {abs_path}")
+        for key, kind in (("readonly", "Read-only"), ("readwrite", "Writable")):
+            for rel_path in config.get(key, []):
+                abs_path = os.path.join(config["source"], rel_path)
+                if not os.path.lexists(abs_path):
+                    raise ValueError(f"{kind} path does not exist: {abs_path}")
 
     def _add_mount_config(self, config: dict):
         self.add_mount(
-            config["source"], config["target"], config["writable"]
+            config["source"], config["target"], config["writable"],
+            readonly=config.get("readonly", []),
+            readwrite=config.get("readwrite", []),
         )
         try:
             for rel_path in config["hidden"]:
@@ -640,13 +818,7 @@ class SandboxFS(pyfuse3.Operations):
 
         with self._lock:
             current = {
-                m["target"]: {
-                    "source": m["source"],
-                    "target": m["target"],
-                    "writable": m["writable"],
-                    "hidden": sorted(m["hidden"]),
-                }
-                for m in self._mounts.values()
+                m["target"]: m for m in self.list_mounts()
             }
 
             # Replacing with an incomplete state would be destructive, so leave
@@ -817,33 +989,33 @@ class SandboxFS(pyfuse3.Operations):
                         del self._inodes[ino]
 
     async def setattr(self, ino, attr, fields, fh, ctx):
-        node = self._get(ino)
-        if node.is_virtual:
-            raise pyfuse3.FUSEError(errno.EPERM)
-        if not node.writable:
-            raise pyfuse3.FUSEError(errno.EACCES)
+        with self._lock:
+            node = self._get(ino)
+            if node.is_virtual:
+                raise pyfuse3.FUSEError(errno.EPERM)
+            self._check_writable(node)
 
-        path = node.real_path
-        try:
-            if fields.update_size:
-                h = self._handles.get(fh) if fh else None
-                if h and h.fd >= 0:
-                    os.ftruncate(h.fd, attr.st_size)
-                else:
-                    os.truncate(path, attr.st_size)
-            if fields.update_mode:
-                os.chmod(path, stat.S_IMODE(attr.st_mode))
-            if fields.update_uid or fields.update_gid:
-                uid = attr.st_uid if fields.update_uid else -1
-                gid = attr.st_gid if fields.update_gid else -1
-                os.lchown(path, uid, gid)
-            if fields.update_atime or fields.update_mtime:
-                st = os.lstat(path)
-                atime = attr.st_atime_ns if fields.update_atime else st.st_atime_ns
-                mtime = attr.st_mtime_ns if fields.update_mtime else st.st_mtime_ns
-                os.utime(path, ns=(atime, mtime), follow_symlinks=False)
-        except OSError as e:
-            raise pyfuse3.FUSEError(e.errno)
+            path = node.real_path
+            try:
+                if fields.update_size:
+                    h = self._handles.get(fh) if fh else None
+                    if h and h.fd >= 0:
+                        os.ftruncate(h.fd, attr.st_size)
+                    else:
+                        os.truncate(path, attr.st_size)
+                if fields.update_mode:
+                    os.chmod(path, stat.S_IMODE(attr.st_mode))
+                if fields.update_uid or fields.update_gid:
+                    uid = attr.st_uid if fields.update_uid else -1
+                    gid = attr.st_gid if fields.update_gid else -1
+                    os.lchown(path, uid, gid)
+                if fields.update_atime or fields.update_mtime:
+                    st = os.lstat(path)
+                    atime = attr.st_atime_ns if fields.update_atime else st.st_atime_ns
+                    mtime = attr.st_mtime_ns if fields.update_mtime else st.st_mtime_ns
+                    os.utime(path, ns=(atime, mtime), follow_symlinks=False)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno)
 
         return await self.getattr(ino, ctx)
 
@@ -951,17 +1123,16 @@ class SandboxFS(pyfuse3.Operations):
 
     async def mkdir(self, parent_ino, name, mode, ctx):
         name_s = name.decode() if isinstance(name, bytes) else name
-        parent = self._get(parent_ino)
-        if parent.is_virtual or not parent.writable:
-            raise pyfuse3.FUSEError(errno.EACCES)
-
-        real_path = os.path.join(parent.real_path, name_s)
-        try:
-            os.mkdir(real_path, mode)
-        except OSError as e:
-            raise pyfuse3.FUSEError(e.errno)
-
         with self._lock:
+            parent = self._get(parent_ino)
+            self._check_writable(parent)
+            real_path = os.path.join(parent.real_path, name_s)
+            self._check_path_writable(parent.mount_target, real_path)
+            try:
+                os.mkdir(real_path, mode)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno)
+
             child = self._alloc(
                 real_path=real_path,
                 mount_target=parent.mount_target,
@@ -972,58 +1143,59 @@ class SandboxFS(pyfuse3.Operations):
 
     async def rmdir(self, parent_ino, name, ctx):
         name_s = name.decode() if isinstance(name, bytes) else name
-        parent = self._get(parent_ino)
-        if parent.is_virtual or not parent.writable:
-            raise pyfuse3.FUSEError(errno.EACCES)
-
-        real_path = os.path.join(parent.real_path, name_s)
-        try:
-            os.rmdir(real_path)
-        except OSError as e:
-            raise pyfuse3.FUSEError(e.errno)
+        with self._lock:
+            parent = self._get(parent_ino)
+            self._check_writable(parent)
+            real_path = os.path.join(parent.real_path, name_s)
+            self._check_path_writable(
+                parent.mount_target, real_path, protect_descendants=True
+            )
+            try:
+                os.rmdir(real_path)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno)
 
     # -- FUSE: files --------------------------------------------------------
 
     async def open(self, ino, flags, ctx):
-        node = self._get(ino)
-        if node.is_virtual:
-            raise pyfuse3.FUSEError(errno.EISDIR)
+        with self._lock:
+            node = self._get(ino)
+            if node.is_virtual:
+                raise pyfuse3.FUSEError(errno.EISDIR)
 
-        writing = flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC)
-        if writing and not node.writable:
-            raise pyfuse3.FUSEError(errno.EACCES)
+            writing = flags & (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC)
+            if writing:
+                self._check_writable(node)
 
-        try:
-            fd = os.open(node.real_path, flags & ~os.O_CREAT)
-        except OSError as e:
-            raise pyfuse3.FUSEError(e.errno)
+            try:
+                fd = os.open(node.real_path, flags & ~os.O_CREAT)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno)
 
-        fh = self._next_fh()
-        self._handles[fh] = _Handle(ino=ino, fd=fd)
+            fh = self._next_fh()
+            self._handles[fh] = _Handle(ino=ino, fd=fd)
         return pyfuse3.FileInfo(fh=fh)
 
     async def create(self, parent_ino, name, mode, flags, ctx):
         name_s = name.decode() if isinstance(name, bytes) else name
-        parent = self._get(parent_ino)
-        if parent.is_virtual or not parent.writable:
-            raise pyfuse3.FUSEError(errno.EACCES)
-
-        real_path = os.path.join(parent.real_path, name_s)
-        try:
-            fd = os.open(real_path, flags | os.O_CREAT, mode)
-        except OSError as e:
-            raise pyfuse3.FUSEError(e.errno)
-
         with self._lock:
+            parent = self._get(parent_ino)
+            self._check_writable(parent)
+            real_path = os.path.join(parent.real_path, name_s)
+            self._check_path_writable(parent.mount_target, real_path)
+            try:
+                fd = os.open(real_path, flags | os.O_CREAT, mode)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno)
+
             child = self._alloc(
                 real_path=real_path,
                 mount_target=parent.mount_target,
                 writable=True,
             )
             child.lookup_count += 1
-
-        fh = self._next_fh()
-        self._handles[fh] = _Handle(ino=child.ino, fd=fd)
+            fh = self._next_fh()
+            self._handles[fh] = _Handle(ino=child.ino, fd=fd)
         entry = await self.getattr(child.ino, ctx)
         return (pyfuse3.FileInfo(fh=fh), entry)
 
@@ -1036,15 +1208,17 @@ class SandboxFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(e.errno)
 
     async def write(self, fh, off, buf):
-        h = self._handles[fh]
-        node = self._inodes.get(h.ino)
-        if not node or not node.active or not node.writable:
-            raise pyfuse3.FUSEError(errno.EACCES)
-        try:
-            os.lseek(h.fd, off, os.SEEK_SET)
-            return os.write(h.fd, buf)
-        except OSError as e:
-            raise pyfuse3.FUSEError(e.errno)
+        with self._lock:
+            h = self._handles[fh]
+            node = self._inodes.get(h.ino)
+            if node is None:
+                raise pyfuse3.FUSEError(errno.EACCES)
+            self._check_writable(node)
+            try:
+                os.lseek(h.fd, off, os.SEEK_SET)
+                return os.write(h.fd, buf)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno)
 
     async def release(self, fh):
         h = self._handles.pop(fh, None)
@@ -1071,60 +1245,74 @@ class SandboxFS(pyfuse3.Operations):
 
     async def unlink(self, parent_ino, name, ctx):
         name_s = name.decode() if isinstance(name, bytes) else name
-        parent = self._get(parent_ino)
-        if parent.is_virtual or not parent.writable:
-            raise pyfuse3.FUSEError(errno.EACCES)
-
-        real_path = os.path.join(parent.real_path, name_s)
-        try:
-            os.unlink(real_path)
-        except OSError as e:
-            raise pyfuse3.FUSEError(e.errno)
+        with self._lock:
+            parent = self._get(parent_ino)
+            self._check_writable(parent)
+            real_path = os.path.join(parent.real_path, name_s)
+            self._check_path_writable(
+                parent.mount_target, real_path, protect_descendants=True
+            )
+            try:
+                os.unlink(real_path)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno)
 
     async def rename(self, p_old_ino, name_old, p_new_ino, name_new, flags, ctx):
         name_old_s = name_old.decode() if isinstance(name_old, bytes) else name_old
         name_new_s = name_new.decode() if isinstance(name_new, bytes) else name_new
 
-        p_old = self._get(p_old_ino)
-        p_new = self._get(p_new_ino)
-        if p_old.is_virtual or p_new.is_virtual:
-            raise pyfuse3.FUSEError(errno.EACCES)
-        if not p_old.writable or not p_new.writable:
-            raise pyfuse3.FUSEError(errno.EACCES)
-
-        old_path = os.path.join(p_old.real_path, name_old_s)
-        new_path = os.path.join(p_new.real_path, name_new_s)
-
-        try:
-            os.rename(old_path, new_path)
-        except OSError as e:
-            raise pyfuse3.FUSEError(e.errno)
-
         with self._lock:
-            old_key = (p_old.mount_target, old_path)
-            if old_key in self._path_to_ino:
-                ino = self._path_to_ino.pop(old_key)
+            p_old = self._get(p_old_ino)
+            p_new = self._get(p_new_ino)
+            self._check_writable(p_old)
+            self._check_writable(p_new)
+            old_path = os.path.join(p_old.real_path, name_old_s)
+            new_path = os.path.join(p_new.real_path, name_new_s)
+            self._check_path_writable(
+                p_old.mount_target, old_path, protect_descendants=True
+            )
+            self._check_path_writable(
+                p_new.mount_target, new_path, protect_descendants=True
+            )
+
+            try:
+                os.rename(old_path, new_path)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno)
+
+            # Cached descendants and open handles must follow directory moves
+            # so later path-policy updates apply to their current paths.
+            moved = [
+                (key, ino) for key, ino in self._path_to_ino.items()
+                if key[0] == p_old.mount_target
+                and self._path_contains(old_path, key[1])
+            ]
+            for key, ino in moved:
+                del self._path_to_ino[key]
+            for key, ino in moved:
                 node = self._inodes.get(ino)
                 if node:
-                    node.real_path = new_path
+                    node.real_path = new_path + key[1][len(old_path):]
                     node.mount_target = p_new.mount_target
-                    self._path_to_ino[(p_new.mount_target, new_path)] = ino
+                    node.writable = self._is_writable(
+                        node.mount_target, node.real_path
+                    )
+                    self._path_to_ino[(node.mount_target, node.real_path)] = ino
 
     async def symlink(self, parent_ino, name, target, ctx):
         name_s = name.decode() if isinstance(name, bytes) else name
         target_s = target.decode() if isinstance(target, bytes) else target
 
-        parent = self._get(parent_ino)
-        if parent.is_virtual or not parent.writable:
-            raise pyfuse3.FUSEError(errno.EACCES)
-
-        real_path = os.path.join(parent.real_path, name_s)
-        try:
-            os.symlink(target_s, real_path)
-        except OSError as e:
-            raise pyfuse3.FUSEError(e.errno)
-
         with self._lock:
+            parent = self._get(parent_ino)
+            self._check_writable(parent)
+            real_path = os.path.join(parent.real_path, name_s)
+            self._check_path_writable(parent.mount_target, real_path)
+            try:
+                os.symlink(target_s, real_path)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno)
+
             child = self._alloc(
                 real_path=real_path,
                 mount_target=parent.mount_target,
@@ -1144,21 +1332,19 @@ class SandboxFS(pyfuse3.Operations):
 
     async def link(self, ino, new_parent_ino, new_name, ctx):
         name_s = new_name.decode() if isinstance(new_name, bytes) else new_name
-        node = self._get(ino)
-        parent = self._get(new_parent_ino)
+        with self._lock:
+            node = self._get(ino)
+            parent = self._get(new_parent_ino)
+            self._check_writable(node)
+            self._check_writable(parent)
+            new_path = os.path.join(parent.real_path, name_s)
+            self._check_path_writable(parent.mount_target, new_path)
+            try:
+                os.link(node.real_path, new_path, follow_symlinks=False)
+            except OSError as e:
+                raise pyfuse3.FUSEError(e.errno)
 
-        if node.is_virtual or parent.is_virtual:
-            raise pyfuse3.FUSEError(errno.EACCES)
-        if not node.writable or not parent.writable:
-            raise pyfuse3.FUSEError(errno.EACCES)
-
-        new_path = os.path.join(parent.real_path, name_s)
-        try:
-            os.link(node.real_path, new_path, follow_symlinks=False)
-        except OSError as e:
-            raise pyfuse3.FUSEError(e.errno)
-
-        node.lookup_count += 1
+            node.lookup_count += 1
         return await self.getattr(ino, ctx)
 
 
@@ -1250,8 +1436,14 @@ class ControlServer:
                 self._fs.add_hide(req["mount"], req["path"])
                 return {"ok": True}
             elif action == "unhide":
-                self._fs.remove_hide(req["mount"], req["path"])
-                return {"ok": True}
+                return self._fs.remove_hide(
+                    req["mount"], req["path"], readonly=req.get("readonly", False),
+                    writable=req.get("writable", False),
+                )
+            elif action == "readonly":
+                return self._fs.add_readonly(req["mount"], req["path"])
+            elif action == "writable":
+                return self._fs.add_writable(req["mount"], req["path"])
             elif action == "list":
                 return {"ok": True, "mounts": self._fs.list_mounts()}
             elif action == "timeouts":
@@ -1312,7 +1504,13 @@ def _print_result(resp: dict):
                 hidden = ""
                 if m.get("hidden"):
                     hidden = f"  hidden: {', '.join(m['hidden'])}"
-                print(f"  {m['source']} -> {m['target']} ({rw}){hidden}")
+                readonly = ""
+                if m.get("readonly"):
+                    readonly = f"  readonly: {', '.join(m['readonly'])}"
+                readwrite = ""
+                if m.get("readwrite"):
+                    readwrite = f"  readwrite: {', '.join(m['readwrite'])}"
+                print(f"  {m['source']} -> {m['target']} ({rw}){hidden}{readonly}{readwrite}")
         else:
             print("OK")
     else:
@@ -1412,6 +1610,12 @@ def main():
     d.add_argument("--hide", action="append", default=[],
                    metavar="TGT:RELPATH",
                    help="Initial hide (repeatable)")
+    d.add_argument("--readonly", action="append", default=[],
+                   metavar="TGT:RELPATH",
+                   help="Initial read-only path rule (repeatable; includes descendants)")
+    d.add_argument("--writable", action="append", default=[],
+                   metavar="TGT:RELPATH",
+                   help="Initial writable path rule (repeatable; includes descendants)")
     d.add_argument("--entry-timeout", type=_timeout_argument,
                    default=_DEFAULT_CACHE_TIMEOUT,
                    help="Directory-entry cache TTL in seconds (default: 5; 0 disables)")
@@ -1444,6 +1648,21 @@ def main():
     uh.add_argument("-s", "--socket", required=True)
     uh.add_argument("mount_target", metavar="mount")
     uh.add_argument("path")
+    unhide_policy = uh.add_mutually_exclusive_group()
+    unhide_policy.add_argument("--readonly", action="store_true",
+                               help="Set a read-only override before making the path visible")
+    unhide_policy.add_argument("--writable", action="store_true",
+                               help="Set a writable override before making the path visible")
+
+    # -- per-path write policy --
+    for command, help_text in (
+        ("readonly", "Set a read-only path override (includes descendants)"),
+        ("writable", "Set a writable path override (includes descendants)"),
+    ):
+        policy = sub.add_parser(command, help=help_text)
+        policy.add_argument("-s", "--socket", required=True)
+        policy.add_argument("mount_target", metavar="mount")
+        policy.add_argument("path", help="Path relative to the mount")
 
     # -- list --
     ls = sub.add_parser("list", help="List mounts and hides")
@@ -1498,6 +1717,22 @@ def main():
             attr_timeout=args.attr_timeout,
         )
 
+        initial_rules = {}
+        for key, kind, specs in (
+            ("readonly", "Read-only", args.readonly),
+            ("readwrite", "Writable", args.writable),
+        ):
+            for spec in specs:
+                parts = spec.split(":", 1)
+                if len(parts) != 2:
+                    p.error(f"Bad {kind.lower()} spec (need TGT:RELPATH): {spec}")
+                try:
+                    target = _normalize_mount_target(parts[0])
+                    path = _normalize_relative_path(parts[1], kind)
+                except ValueError as e:
+                    p.error(f"{kind} rule failed ({spec}): {e}")
+                initial_rules.setdefault(target, {}).setdefault(key, []).append(path)
+
         # Parse initial mounts
         for rw, specs in [(False, args.ro_mount), (True, args.rw_mount)]:
             for spec in specs:
@@ -1505,9 +1740,14 @@ def main():
                 src = parts[0]
                 tgt = parts[1] if len(parts) > 1 else os.path.basename(src)
                 try:
-                    fs.add_mount(src, tgt, rw)
+                    fs.add_mount(
+                        src, tgt, rw,
+                        **initial_rules.pop(_normalize_mount_target(tgt), {}),
+                    )
                 except Exception as e:
                     p.error(f"Mount failed ({spec}): {e}")
+        if initial_rules:
+            p.error(f"Write-policy rule targets are not mounted: {', '.join(initial_rules)}")
 
         # Parse initial hides: TGT:RELPATH
         for spec in args.hide:
@@ -1566,6 +1806,15 @@ def main():
     elif args.cmd == "unhide":
         _print_result(_send(args.socket, {
             "action": "unhide",
+            "mount": args.mount_target,
+            "path": args.path,
+            "readonly": args.readonly,
+            "writable": args.writable,
+        }))
+
+    elif args.cmd in ("readonly", "writable"):
+        _print_result(_send(args.socket, {
+            "action": args.cmd,
             "mount": args.mount_target,
             "path": args.path,
         }))

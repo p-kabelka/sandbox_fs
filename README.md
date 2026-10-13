@@ -13,6 +13,67 @@ python sandbox_fs.py daemon /mnt/sandbox \
 The default control socket is `/mnt/sandbox.sock`. Use `-s SOCKET` for control
 commands.
 
+## Per-path read/write overrides
+
+Both commands set explicit overrides for a file or directory, independently
+of the mount's default policy:
+
+```sh
+# Protect .git within a read/write mount
+python sandbox_fs.py readonly -s /mnt/sandbox.sock /project .git
+
+# Grant write access to editable within a read-only mount
+python sandbox_fs.py writable -s /mnt/sandbox.sock /reference editable
+```
+
+Paths are relative to the mount target, must exist when a rule is added, and
+cannot contain `..`. Directory rules include all descendants. The **most
+specific matching rule wins**; without a matching rule, the mount's default
+applies. Running the opposite command at the same path replaces its override:
+
+```sh
+python sandbox_fs.py readonly -s /mnt/sandbox.sock /project .git
+python sandbox_fs.py writable -s /mnt/sandbox.sock /project .git
+```
+
+More-specific child rules are preserved when a parent rule changes. For
+example, this makes `cache` writable, except for its read-only `index`:
+
+```sh
+python sandbox_fs.py writable -s /mnt/sandbox.sock /reference cache
+python sandbox_fs.py readonly -s /mnt/sandbox.sock /reference cache/index
+```
+
+The daemon removes advertised write bits on effectively read-only paths and
+rejects writes (including through already open handles), metadata changes,
+creation, deletion, and renames affecting protected paths. Renaming an ancestor
+of a protected path is also rejected. Directory operations still require a
+writable parent: a writable file inside a read-only directory can be edited,
+but cannot be deleted or renamed there. Host permissions are not modified;
+write access still requires suitable host permissions, and rules are independent
+for each mount.
+
+Hiding a path and ordinary `unhide` preserve its overrides. To set a policy
+and unhide atomically:
+
+```sh
+python sandbox_fs.py unhide -s /mnt/sandbox.sock /project .git --readonly
+python sandbox_fs.py unhide -s /mnt/sandbox.sock /reference editable --writable
+```
+
+Configure initial rules on startup:
+
+```sh
+python sandbox_fs.py daemon /mnt/sandbox \
+    --rw-mount /host/project:/project --readonly /project:.git \
+    --ro-mount /host/reference:/reference --writable /reference:editable
+```
+
+Runtime changes invalidate kernel caches. `list` shows the rules, and `save`
+and `load` persist them in optional `readonly` and `readwrite` lists on each
+mount. Older state files without those fields remain supported. A state file
+or startup configuration cannot put the same normalized path in both lists.
+
 ## Cache controls
 
 Both directory-entry and attribute timeouts default to **5 seconds**. They are

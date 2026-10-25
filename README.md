@@ -13,10 +13,22 @@ python sandbox_fs.py daemon /mnt/sandbox \
 The default control socket is `/mnt/sandbox.sock`. Use `-s SOCKET` for control
 commands.
 
-## Per-path read/write overrides
+## Mount and per-path read/write policies
 
-Both commands set explicit overrides for a file or directory, independently
-of the mount's default policy:
+Omit the relative path to change an existing mount's default policy:
+
+```sh
+python sandbox_fs.py writable -s /mnt/sandbox.sock /project
+python sandbox_fs.py readonly -s /mnt/sandbox.sock /project
+```
+
+These commands preserve all hidden paths and explicit read-only and writable
+subpath overrides, including rules set by `unhide --readonly` or
+`unhide --writable`. Only paths without a matching override inherit the new
+mount default.
+
+With a relative path, both commands set explicit overrides for a file or
+directory, independently of the mount's default policy:
 
 ```sh
 # Protect .git within a read/write mount

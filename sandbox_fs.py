@@ -32,6 +32,10 @@ Usage:
   # Grant write access to a path within a read-only mount
   sandbox_fs.py writable -s /mnt/sandbox.sock /virtual/mount editable
 
+  # Change a mount's default policy, preserving all subpath rules
+  sandbox_fs.py writable -s /mnt/sandbox.sock /virtual/mount
+  sandbox_fs.py readonly -s /mnt/sandbox.sock /virtual/mount
+
   # List current state
   sandbox_fs.py list -s /mnt/sandbox.sock
 
@@ -626,7 +630,7 @@ class SandboxFS(pyfuse3.Operations):
         if readonly and writable:
             raise ValueError("Read-only and writable options are mutually exclusive")
         if readonly or writable:
-            return self._set_path_writable(
+            return self._set_write_policy(
                 mount_target, rel_path, writable, unhide=True
             )
         self._set_hidden(mount_target, rel_path, False)
@@ -661,54 +665,68 @@ class SandboxFS(pyfuse3.Operations):
             mount_target,
         )
 
-    def add_readonly(self, mount_target: str, rel_path: str) -> dict:
-        return self._set_path_writable(mount_target, rel_path, False)
+    def add_readonly(self, mount_target: str, rel_path: str | None = None) -> dict:
+        return self._set_write_policy(mount_target, rel_path, False)
 
-    def add_writable(self, mount_target: str, rel_path: str) -> dict:
-        return self._set_path_writable(mount_target, rel_path, True)
+    def add_writable(self, mount_target: str, rel_path: str | None = None) -> dict:
+        return self._set_write_policy(mount_target, rel_path, True)
 
-    def _set_path_writable(
-        self, mount_target: str, rel_path: str, writable: bool, unhide: bool = False
+    def _set_write_policy(
+        self,
+        mount_target: str,
+        rel_path: str | None,
+        writable: bool,
+        unhide: bool = False,
     ) -> dict:
         mount_target = _normalize_mount_target(mount_target)
         kind = "Writable" if writable else "Read-only"
-        rel_path = _normalize_relative_path(rel_path, kind)
+        if rel_path is not None or unhide:
+            rel_path = _normalize_relative_path(rel_path, kind)
 
         with self._cache_control_lock:
             with self._lock:
                 if mount_target not in self._mounts:
                     raise ValueError(f"Not mounted: {mount_target}")
                 info = self._mounts[mount_target]
-                abs_path = os.path.join(info["source"], rel_path)
-                _validate_paths(info["source"], [rel_path], f"{kind} path")
-                # The last command at this exact path wins; other, more
-                # specific rules remain in effect beneath it.
-                key, opposite = (
-                    ("readwrite", "readonly") if writable else ("readonly", "readwrite")
-                )
-                info[opposite].discard(rel_path)
-                info[key].add(rel_path)
-                if unhide:
-                    info["hidden"].discard(rel_path)
+                entries = []
+                if rel_path is None:
+                    # Only change the fallback; explicit subpath rules stay intact.
+                    info["writable"] = writable
+                else:
+                    abs_path = os.path.join(info["source"], rel_path)
+                    _validate_paths(info["source"], [rel_path], f"{kind} path")
+                    # The last command at this exact path wins; other, more
+                    # specific rules remain in effect beneath it.
+                    key, opposite = (
+                        ("readwrite", "readonly") if writable else ("readonly", "readwrite")
+                    )
+                    info[opposite].discard(rel_path)
+                    info[key].add(rel_path)
+                    if unhide:
+                        info["hidden"].discard(rel_path)
+                    entry = self._cached_entry(mount_target, abs_path)
+                    if entry is not None:
+                        entries.append(entry)
                 self._refresh_writable(mount_target)
-                entry = self._cached_entry(mount_target, abs_path)
-                entries = [] if entry is None else [entry]
 
             # Drop old write bits and cached entries/data. This must run on
             # the control thread without _lock: FUSE requests may need it.
             result = self._invalidate_cache(extra_entries=entries)
             if not result["ok"]:
                 result["error"] = (
-                    "Path write policy updated, but some cache entries "
-                    "could not be invalidated"
+                    f"{'Mount' if rel_path is None else 'Path'} write policy updated, "
+                    "but some cache entries could not be invalidated"
                 )
-        log.info(
-            "%s rule set for %s in mount %s%s",
-            kind,
-            rel_path,
-            mount_target,
-            " (unhidden)" if unhide else "",
-        )
+        if rel_path is None:
+            log.info("Mount %s write policy set to %s", mount_target, kind)
+        else:
+            log.info(
+                "%s rule set for %s in mount %s%s",
+                kind,
+                rel_path,
+                mount_target,
+                " (unhidden)" if unhide else "",
+            )
         return result
 
     def list_mounts(self) -> list[dict]:
@@ -1354,9 +1372,9 @@ class ControlServer:
                     writable=req.get("writable", False),
                 )
             elif action == "readonly":
-                return self._fs.add_readonly(req["mount"], req["path"])
+                return self._fs.add_readonly(req["mount"], req.get("path"))
             elif action == "writable":
-                return self._fs.add_writable(req["mount"], req["path"])
+                return self._fs.add_writable(req["mount"], req.get("path"))
             elif action == "list":
                 return {"ok": True, "mounts": self._fs.list_mounts()}
             elif action == "timeouts":
@@ -1591,15 +1609,20 @@ def main():
         help="Set a writable override before making the path visible",
     )
 
-    # -- per-path write policy --
+    # -- mount and per-path write policy --
     for command, help_text in (
-        ("readonly", "Set a read-only path override (includes descendants)"),
-        ("writable", "Set a writable path override (includes descendants)"),
+        ("readonly", "Set a mount default or path override to read-only"),
+        ("writable", "Set a mount default or path override to writable"),
     ):
         policy = sub.add_parser(command, help=help_text)
         policy.add_argument("-s", "--socket", required=True)
         policy.add_argument("mount_target", metavar="mount")
-        policy.add_argument("path", help="Path relative to the mount")
+        policy.add_argument(
+            "path",
+            nargs="?",
+            help="Path relative to the mount (omit to change the mount default; "
+            "preserves subpath rules)",
+        )
 
     # -- list --
     ls = sub.add_parser("list", help="List mounts and hides")
@@ -1760,8 +1783,9 @@ def main():
         command = {
             "action": args.cmd,
             "mount": args.mount_target,
-            "path": args.path,
         }
+        if args.path is not None:
+            command["path"] = args.path
         if args.cmd == "unhide":
             command.update(readonly=args.readonly, writable=args.writable)
         _print_result(_send(args.socket, command))

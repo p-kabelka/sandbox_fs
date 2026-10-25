@@ -480,6 +480,59 @@ class PathWritePolicyTests(unittest.TestCase):
         self.assert_denied(self.fs.open(self.lookup(".git/config"), os.O_RDWR, None))
         self.open_handle(self.lookup(".git/objects/data"))
 
+    def test_mount_defaults_preserve_subpath_rules_and_other_mounts(self):
+        self.fs.add_mount(self.source, "/other", writable=True)
+        other = self.fs._mounts["/other"]["inode"]
+        other_work = self.lookup("work.txt", root=other)
+        work = self.lookup("work.txt")
+        work_fh = self.open_handle(work)
+        self.fs.add_readonly("/project", ".git")
+        self.fs.add_writable("/project", ".git/objects")
+        self.fs.add_hide("/project", ".git-backup")
+        config = self.lookup(".git/config")
+        data = self.lookup(".git/objects/data")
+        data_fh = self.open_handle(data)
+        original = self.fs.list_mounts()
+
+        def invalidate(ino):
+            self.assertFalse(self.fs._lock._is_owned())
+
+        self.inodes.reset_mock()
+        self.entries.reset_mock()
+        self.inodes.side_effect = invalidate
+        for action in ("readonly", "writable", "writable", "readonly"):
+            with self.subTest(action=action):
+                result = self.control._dispatch({"action": action, "mount": "project/"})
+                self.assertTrue(result["ok"])
+                writable = action == "writable"
+                self.assertEqual(
+                    self.fs.list_mounts(),
+                    [{**original[0], "writable": writable}, original[1]],
+                )
+                self.assertEqual(self.fs._mounts["/project"]["inode"], self.root)
+                for ino in (self.root, work):
+                    self.assertEqual(self.fs._inodes[ino].writable, writable)
+                    self.assertEqual(
+                        bool(asyncio.run(self.fs.getattr(ino)).st_mode & 0o222),
+                        writable,
+                    )
+                self.assert_denied(self.fs.open(config, os.O_RDWR, None))
+                self.assertEqual(asyncio.run(self.fs.write(data_fh, 0, b"allowed!")), 8)
+                self.assertEqual(self.lookup(".git/objects/data"), data)
+                if writable:
+                    self.assertEqual(asyncio.run(self.fs.write(work_fh, 0, b"edit")), 4)
+                else:
+                    self.assert_denied(self.fs.write(work_fh, 0, b"blocked"))
+                    self.assert_denied(self.fs.open(work, os.O_RDWR, None))
+                self.open_handle(other_work)
+                with self.assertRaises(pyfuse3.FUSEError) as raised:
+                    self.lookup(".git-backup")
+                self.assertEqual(raised.exception.errno, errno.ENOENT)
+        for ino in (self.root, work, config, data):
+            self.inodes.assert_any_call(ino)
+        self.entries.assert_any_call(pyfuse3.ROOT_INODE, b"project")
+        self.entries.assert_any_call(self.root, b"work.txt")
+
     def test_commands_are_opposites_and_override_either_mount_default(self):
         for default in (False, True):
             target = f"/default-{default}"
@@ -702,9 +755,35 @@ class PathWritePolicyTests(unittest.TestCase):
         self.assertIn("policy updated", result["error"])
         self.open_handle(ino)
 
+    def test_mount_notification_failure_keeps_new_default_enforced(self):
+        work = self.lookup("work.txt")
+        fh = self.open_handle(work)
+        self.fs.add_readonly("/project", ".git")
+        config = self.lookup(".git/config")
+        self.inodes.side_effect = OSError(errno.EIO, "notification failed")
+        for action in ("readonly", "writable"):
+            with self.subTest(action=action):
+                result = self.control._dispatch({"action": action, "mount": "/project"})
+                self.assertFalse(result["ok"])
+                self.assertIn("Mount write policy updated", result["error"])
+                self.assert_denied(self.fs.open(config, os.O_RDWR, None))
+                if action == "writable":
+                    self.assertEqual(asyncio.run(self.fs.write(fh, 0, b"allowed!")), 8)
+                else:
+                    self.assert_denied(self.fs.write(fh, 0, b"blocked"))
+                    self.assert_denied(self.fs.open(work, os.O_RDWR, None))
+
     def test_invalid_rules_are_rejected_without_changing_state(self):
         original = self.fs.list_mounts()
         for action in ("readonly", "writable"):
+            result = self.control._dispatch({"action": action, "mount": "/missing"})
+            self.assertFalse(result["ok"])
+            self.assertEqual(self.fs.list_mounts(), original)
+            result = self.control._dispatch(
+                {"action": "unhide", "mount": "/project", "path": None, action: True}
+            )
+            self.assertFalse(result["ok"])
+            self.assertEqual(self.fs.list_mounts(), original)
             for path in (
                 "",
                 ".",
@@ -829,6 +908,59 @@ class PathWritePolicyTests(unittest.TestCase):
         )
         self.assertIn("Unchanged: /reference", cli("load", state_path))
         self.assertIn("readwrite: .git", cli("list"))
+
+    def test_cli_mount_defaults_preserve_hidden_and_loaded_write_rules(self):
+        self.control.start()
+        self.addCleanup(self.control.stop)
+        state_path = os.path.join(self.source, "state.json")
+
+        def cli(*args):
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["sandbox_fs.py", args[0], "-s", self.control._path, *args[1:]],
+                ),
+                mock.patch.object(sys, "stdout", output),
+            ):
+                main()
+            return output.getvalue()
+
+        cli("readonly", "project")
+        cli("hide", "project", ".git")
+        cli("writable", "/project")
+        self.assertIn("(rw)", cli("list"))
+        self.assertIn("hidden: .git", cli("list"))
+        with self.assertRaises(pyfuse3.FUSEError) as raised:
+            self.lookup(".git")
+        self.assertEqual(raised.exception.errno, errno.ENOENT)
+
+        # Restore a writable mount with a hidden .git, then unhide it read-only.
+        cli("save", state_path)
+        cli("readonly", "/project")
+        self.assertIn("Loaded: /project", cli("load", state_path, "--force"))
+        self.root = self.fs._mounts["/project"]["inode"]
+        cli("unhide", "--readonly", "project", ".git")
+        cli("writable", "/project")
+        self.assert_denied(self.fs.open(self.lookup(".git/config"), os.O_RDWR, None))
+        self.assertEqual(self.fs.list_mounts()[0]["hidden"], [])
+
+        # Both kinds of explicit overrides survive changing and saving the default.
+        cli("writable", "/project", ".git/objects")
+        cli("readonly", "/project")
+        cli("save", state_path)
+        saved = _read_state(state_path)
+        self.assertFalse(saved[0]["writable"])
+        self.assertEqual(saved[0]["readonly"], [".git"])
+        self.assertEqual(saved[0]["readwrite"], [".git/objects"])
+        cli("writable", "/project")
+        cli("load", state_path, "--force")
+        self.root = self.fs._mounts["/project"]["inode"]
+        self.assertEqual(self.fs.list_mounts(), saved)
+        self.assert_denied(self.fs.open(self.lookup("work.txt"), os.O_RDWR, None))
+        self.assert_denied(self.fs.open(self.lookup(".git/config"), os.O_RDWR, None))
+        self.open_handle(self.lookup(".git/objects/data"))
 
     def test_invalid_saved_write_rules_leave_existing_mounts_untouched(self):
         original = self.fs.list_mounts()

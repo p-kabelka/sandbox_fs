@@ -293,6 +293,59 @@ class FuseIntegrationTests(unittest.TestCase):
         self._cli("unhide", "-s", self.socket_path, "/writable", "secret.txt")
         self.assertEqual(secret.read_text(encoding="utf-8"), "hidden data\n")
 
+    def test_mount_defaults_refresh_cached_permissions_and_preserve_subpath_state(self):
+        self._cli("mount", "-s", self.socket_path, self.source_rw, "/project")
+        self._cli(
+            "timeouts",
+            "-s",
+            self.socket_path,
+            "--entry-timeout",
+            "300",
+            "--attr-timeout",
+            "300",
+        )
+        project = self.mountpoint / "project"
+        editable = project / "editable.txt"
+        secret = project / "secret.txt"
+        self._cli("hide", "-s", self.socket_path, "/project", "secret.txt")
+        self.assertFalse(project.stat().st_mode & 0o222)
+        self.assertFalse(editable.stat().st_mode & 0o222)
+        self.assertFalse(secret.exists())
+
+        self._cli("writable", "-s", self.socket_path, "/project")
+        self.assertTrue(project.stat().st_mode & 0o222)
+        self.assertTrue(editable.stat().st_mode & 0o222)
+        self.assertFalse(secret.exists())
+        self.assertNotIn("secret.txt", {entry.name for entry in project.iterdir()})
+        self._cli(
+            "unhide", "-s", self.socket_path, "--readonly", "/project", "secret.txt"
+        )
+
+        with open(editable, "r+b", buffering=0) as writer:
+            for action in ("writable", "readonly", "writable"):
+                with self.subTest(action=action):
+                    self._cli(action, "-s", self.socket_path, "/project")
+                    writable = action == "writable"
+                    self.assertEqual(bool(project.stat().st_mode & 0o222), writable)
+                    self.assertEqual(bool(editable.stat().st_mode & 0o222), writable)
+                    self.assertFalse(secret.stat().st_mode & 0o222)
+                    self.assertEqual(secret.read_text(encoding="utf-8"), "hidden data\n")
+                    self._assert_read_only(secret)
+                    if writable:
+                        writer.seek(0)
+                        self.assertEqual(writer.write(b"allowed!"), 8)
+                        created = project / "created.txt"
+                        created.write_text("created", encoding="utf-8")
+                        created.unlink()
+                    else:
+                        with self.assertRaises(OSError) as raised:
+                            writer.write(b"blocked")
+                        self.assertIn(raised.exception.errno, (errno.EACCES, errno.EROFS))
+                        self._assert_read_only(project / "blocked.txt")
+        self.assertEqual(
+            (self.source_rw / "secret.txt").read_text(encoding="utf-8"), "hidden data\n"
+        )
+
     def test_runtime_timeouts_replace_long_lived_cached_attributes(self):
         defaults = self._cli("timeouts", "-s", self.socket_path)
         self.assertIn("Entry timeout: 5 seconds", defaults.stdout)

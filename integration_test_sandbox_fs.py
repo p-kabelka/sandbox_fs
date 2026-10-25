@@ -555,9 +555,22 @@ class FuseIntegrationTests(unittest.TestCase):
         cache_source.mkdir()
         (cache_source / "index").write_text("index", encoding="utf-8")
         (cache_source / "data").write_text("data", encoding="utf-8")
-        self._cli("mount", "-s", self.socket_path, self.source_ro, "/reference")
-        self._cli("writable", "-s", self.socket_path, "/reference", "cache")
-        self._cli("readonly", "-s", self.socket_path, "/reference", "cache/index")
+        self._cli(
+            "mount",
+            "-s",
+            self.socket_path,
+            self.source_ro,
+            "/reference",
+            "--writable",
+            "cache",
+            "--readonly",
+            "cache/index",
+        )
+        reference = self.mountpoint / "reference"
+        cache = reference / "cache"
+        (cache / "data").write_text("initial update", encoding="utf-8")
+        self._assert_read_only(cache / "index")
+        self._assert_read_only(reference / "reference.txt")
         self._cli("save", "-s", self.socket_path, self.state_path)
         self._stop_daemon()
         self._start_daemon()
@@ -567,8 +580,6 @@ class FuseIntegrationTests(unittest.TestCase):
         self.assertIn("(ro)", listing)
         self.assertIn("readwrite: cache", listing)
         self.assertIn("readonly: cache/index", listing)
-        reference = self.mountpoint / "reference"
-        cache = reference / "cache"
         (cache / "data").write_text("updated", encoding="utf-8")
         (cache / "new").write_text("created", encoding="utf-8")
         self.assertEqual((cache_source / "data").read_text(encoding="utf-8"), "updated")

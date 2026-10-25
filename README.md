@@ -15,6 +15,25 @@ commands.
 
 ## Mount and per-path read/write policies
 
+Set subpath overrides when adding a mount with repeatable `--readonly RELPATH`
+and `--writable RELPATH` options. The mount is read-only by default; `-w` makes
+its default writable:
+
+```sh
+# Writable project, read-only .git, writable .git/objects, read-only work.txt
+python sandbox_fs.py mount -s /mnt/sandbox.sock /host/project /project -w \
+    --readonly .git --writable .git/objects --readonly work.txt
+
+# Read-only reference, writable cache and output, read-only cache/index
+python sandbox_fs.py mount -s /mnt/sandbox.sock /host/reference /reference \
+    --writable cache --writable output --readonly cache/index
+```
+
+Both options can be repeated and combined, with the most-specific matching
+rule winning regardless of option order. All rules are validated and installed
+before the mount becomes visible. The same normalized path cannot be given
+both policies in one mount command.
+
 Omit the relative path to change an existing mount's default policy:
 
 ```sh

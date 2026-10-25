@@ -16,6 +16,10 @@ Usage:
   # Add a mount at runtime
   sandbox_fs.py mount -s /mnt/sandbox.sock /host/path /virtual/path -w
 
+  # Add a mount with subpath overrides (repeatable; most specific rule wins)
+  sandbox_fs.py mount -s /mnt/sandbox.sock /host/path /virtual/path -w \\
+      --readonly .git --writable .git/objects
+
   # Hide a path within a mount
   sandbox_fs.py hide -s /mnt/sandbox.sock /virtual/mount .secrets
 
@@ -1355,7 +1359,11 @@ class ControlServer:
         try:
             if action == "mount":
                 self._fs.add_mount(
-                    req["source"], req["target"], req.get("writable", False)
+                    req["source"],
+                    req["target"],
+                    req.get("writable", False),
+                    readonly=req.get("readonly", []),
+                    readwrite=req.get("readwrite", []),
                 )
                 return {"ok": True}
             elif action == "unmount":
@@ -1579,7 +1587,27 @@ def main():
     m.add_argument("-s", "--socket", required=True)
     m.add_argument("source")
     m.add_argument("target", nargs="?", default=None)
-    m.add_argument("-w", "--writable", action="store_true")
+    m.add_argument(
+        "-w",
+        dest="writable",
+        action="store_true",
+        help="Make the mount writable by default (default: read-only)",
+    )
+    m.add_argument(
+        "--readonly",
+        action="append",
+        default=[],
+        metavar="RELPATH",
+        help="Read-only subpath override (repeatable; includes descendants)",
+    )
+    m.add_argument(
+        "--writable",
+        dest="readwrite",
+        action="append",
+        default=[],
+        metavar="RELPATH",
+        help="Writable subpath override (repeatable; includes descendants)",
+    )
 
     # -- unmount --
     u = sub.add_parser("unmount", help="Remove a mount")
@@ -1764,6 +1792,8 @@ def main():
                     "source": args.source,
                     "target": target,
                     "writable": args.writable,
+                    "readonly": args.readonly,
+                    "readwrite": args.readwrite,
                 },
             )
         )

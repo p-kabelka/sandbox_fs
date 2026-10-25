@@ -826,6 +826,119 @@ class PathWritePolicyTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(self.fs.list_mounts(), original)
 
+    def test_cli_mount_installs_repeated_rules_with_most_specific_wins(self):
+        self.control.start()
+        self.addCleanup(self.control.stop)
+        rules = [
+            ("--readonly", ".git/objects/data"),
+            ("--writable", "./.git/objects/"),
+            ("--readonly", ".git"),
+            ("--writable", "work.txt"),
+            ("--readonly", "./.git/"),
+        ]
+        published = []
+        self.entries.side_effect = lambda *args, **kwargs: published.append(
+            self.fs.list_mounts()
+        )
+        for default in (False, True):
+            for reverse in (False, True):
+                with self.subTest(default=default, reverse=reverse):
+                    target = f"/mount-{default}-{reverse}"
+                    ordered = list(reversed(rules)) if reverse else rules
+                    options = [arg for rule in ordered for arg in rule]
+                    args = [
+                        "sandbox_fs.py",
+                        "mount",
+                        "-s",
+                        self.control._path,
+                        self.source,
+                        target,
+                        *(["-w"] if default else []),
+                        *options,
+                    ]
+                    published.clear()
+                    with (
+                        mock.patch.object(sys, "argv", args),
+                        mock.patch.object(sys, "stdout", io.StringIO()),
+                    ):
+                        main()
+                    # The initial notification must already see all overrides.
+                    self.assertEqual(published, [self.fs.list_mounts()])
+                    state = next(m for m in self.fs.list_mounts() if m["target"] == target)
+                    self.assertEqual(state["writable"], default)
+                    self.assertEqual(state["readonly"], [".git", ".git/objects/data"])
+                    self.assertEqual(state["readwrite"], [".git/objects", "work.txt"])
+                    root = self.fs._mounts[target]["inode"]
+                    self.assertEqual(
+                        bool(asyncio.run(self.fs.getattr(root)).st_mode & 0o222), default
+                    )
+                    for path, writable in (
+                        (".git", False),
+                        (".git/config", False),
+                        (".git/objects", True),
+                        (".git/objects/data", False),
+                        ("work.txt", True),
+                        (".git-backup", default),
+                    ):
+                        ino = self.lookup(path, root=root)
+                        self.assertEqual(
+                            bool(asyncio.run(self.fs.getattr(ino)).st_mode & 0o222),
+                            writable,
+                            path,
+                        )
+                    for path in (".git/config", ".git/objects/data"):
+                        self.assert_denied(
+                            self.fs.open(self.lookup(path, root=root), os.O_RDWR, None)
+                        )
+                    fh = self.open_handle(self.lookup("work.txt", root=root))
+                    self.assertEqual(asyncio.run(self.fs.write(fh, 0, b"allowed!")), 8)
+                    objects = self.lookup(".git/objects", root=root)
+                    info, _ = asyncio.run(
+                        self.fs.create(objects, b"new", 0o644, os.O_RDWR, None)
+                    )
+                    self.addCleanup(lambda fh=info.fh: asyncio.run(self.fs.release(fh)))
+                    self.assertEqual(asyncio.run(self.fs.write(info.fh, 0, b"created")), 7)
+                    asyncio.run(self.fs.unlink(objects, b"new", None))
+
+    def test_cli_mount_rejects_invalid_overrides_before_publishing(self):
+        self.control.start()
+        self.addCleanup(self.control.stop)
+        original = self.fs.list_mounts()
+        self.entries.reset_mock()
+        for options, message in (
+            (["--readonly", "missing"], "does not exist"),
+            (["--writable", "missing"], "does not exist"),
+            (["--readonly", ".git", "--writable", "missing"], "does not exist"),
+            (["--writable", ".git", "--readonly", "../work.txt"], "cannot contain '..'"),
+            (["--writable", ""], "cannot be empty"),
+            (["--readonly", ".git", "--writable", "./.git/"], "Conflicting"),
+        ):
+            stderr = io.StringIO()
+            with (
+                self.subTest(options=options),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "sandbox_fs.py",
+                        "mount",
+                        "-s",
+                        self.control._path,
+                        self.source,
+                        "/invalid",
+                        "-w",
+                        *options,
+                    ],
+                ),
+                mock.patch.object(sys, "stderr", stderr),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                main()
+            self.assertEqual(raised.exception.code, 1)
+            self.assertIn(message, stderr.getvalue())
+            self.assertEqual(self.fs.list_mounts(), original)
+            self.entries.assert_not_called()
+
     def test_cli_commands_round_trip_and_state_restores_readonly_rules(self):
         self.control.start()
         self.addCleanup(self.control.stop)

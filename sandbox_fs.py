@@ -16,9 +16,9 @@ Usage:
   # Add a mount at runtime
   sandbox_fs.py mount -s /mnt/sandbox.sock /host/path /virtual/path -w
 
-  # Add a mount with subpath overrides (repeatable; most specific rule wins)
+  # Add a mount with initial hides and subpath write overrides (repeatable)
   sandbox_fs.py mount -s /mnt/sandbox.sock /host/path /virtual/path -w \\
-      --readonly .git --writable .git/objects
+      --readonly .git --writable .git/objects --hide .env --hide .secrets
 
   # Hide a path within a mount
   sandbox_fs.py hide -s /mnt/sandbox.sock /virtual/mount .secrets
@@ -498,11 +498,15 @@ class SandboxFS(pyfuse3.Operations):
         writable: bool = False,
         readonly: list[str] | None = None,
         readwrite: list[str] | None = None,
+        hidden: list[str] | None = None,
     ):
         source = os.path.realpath(source)
         if not os.path.exists(source):
             raise ValueError(f"Source does not exist: {source}")
         target = _normalize_mount_target(target)
+        hidden_paths = {
+            _normalize_relative_path(path, "Hidden") for path in (hidden or [])
+        }
         readonly_paths = {
             _normalize_relative_path(path, "Read-only") for path in (readonly or [])
         }
@@ -515,6 +519,7 @@ class SandboxFS(pyfuse3.Operations):
             ("Writable", readwrite_paths),
         ):
             _validate_paths(source, paths, f"{kind} path")
+        _validate_paths(source, hidden_paths, "Hidden path", follow_symlinks=True)
 
         with self._lock:
             if target in self._mounts:
@@ -559,7 +564,7 @@ class SandboxFS(pyfuse3.Operations):
                 "target": target,
                 "writable": writable,
                 "inode": node.ino,
-                "hidden": set(),
+                "hidden": hidden_paths,
                 "readonly": readonly_paths,
                 "readwrite": readwrite_paths,
             }
@@ -1364,6 +1369,7 @@ class ControlServer:
                     req.get("writable", False),
                     readonly=req.get("readonly", []),
                     readwrite=req.get("readwrite", []),
+                    hidden=req.get("hidden", []),
                 )
                 return {"ok": True}
             elif action == "unmount":
@@ -1594,6 +1600,13 @@ def main():
         help="Make the mount writable by default (default: read-only)",
     )
     m.add_argument(
+        "--hide",
+        action="append",
+        default=[],
+        metavar="RELPATH",
+        help="Initially hidden subpath (repeatable; includes descendants)",
+    )
+    m.add_argument(
         "--readonly",
         action="append",
         default=[],
@@ -1792,6 +1805,7 @@ def main():
                     "source": args.source,
                     "target": target,
                     "writable": args.writable,
+                    "hidden": args.hide,
                     "readonly": args.readonly,
                     "readwrite": args.readwrite,
                 },

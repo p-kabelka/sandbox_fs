@@ -34,6 +34,18 @@ rule winning regardless of option order. All rules are validated and installed
 before the mount becomes visible. The same normalized path cannot be given
 both policies in one mount command.
 
+Hide files or directories from the start with repeatable `--hide RELPATH`
+options, which can be combined with write-policy overrides:
+
+```sh
+python sandbox_fs.py mount -s /mnt/sandbox.sock /host/project /project -w \
+    --hide .env --hide .secrets --readonly .git
+```
+
+Hidden paths must exist and are validated and installed before the mount
+becomes visible. Hiding a directory also hides all descendants. Use `unhide`
+to reveal a path later; its write-policy overrides are preserved.
+
 Omit the relative path to change an existing mount's default policy:
 
 ```sh

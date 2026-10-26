@@ -827,6 +827,10 @@ class PathWritePolicyTests(unittest.TestCase):
         self.assertEqual(self.fs.list_mounts(), original)
 
     def test_cli_mount_installs_repeated_rules_with_most_specific_wins(self):
+        os.mkdir(os.path.join(self.source, "secrets"))
+        for path in ("secret.txt", "secrets/data"):
+            with open(os.path.join(self.source, path), "w", encoding="utf-8") as f:
+                f.write("hidden")
         self.control.start()
         self.addCleanup(self.control.stop)
         rules = [
@@ -835,6 +839,9 @@ class PathWritePolicyTests(unittest.TestCase):
             ("--readonly", ".git"),
             ("--writable", "work.txt"),
             ("--readonly", "./.git/"),
+            ("--hide", "./secret.txt"),
+            ("--hide", "secrets"),
+            ("--hide", "./secrets/"),
         ]
         published = []
         self.entries.side_effect = lambda *args, **kwargs: published.append(
@@ -866,9 +873,29 @@ class PathWritePolicyTests(unittest.TestCase):
                     self.assertEqual(published, [self.fs.list_mounts()])
                     state = next(m for m in self.fs.list_mounts() if m["target"] == target)
                     self.assertEqual(state["writable"], default)
+                    self.assertEqual(state["hidden"], ["secret.txt", "secrets"])
                     self.assertEqual(state["readonly"], [".git", ".git/objects/data"])
                     self.assertEqual(state["readwrite"], [".git/objects", "work.txt"])
                     root = self.fs._mounts[target]["inode"]
+                    for path in ("secret.txt", "secrets", "secrets/data"):
+                        with self.assertRaises(pyfuse3.FUSEError) as raised:
+                            self.lookup(path, root=root)
+                        self.assertEqual(raised.exception.errno, errno.ENOENT)
+                    fh = asyncio.run(self.fs.opendir(root, None))
+                    names = []
+                    with mock.patch.object(
+                        pyfuse3,
+                        "readdir_reply",
+                        side_effect=lambda token, name, attr, cookie: (
+                            names.append(name) or True
+                        ),
+                        create=True,
+                    ):
+                        asyncio.run(self.fs.readdir(fh, 0, object()))
+                    asyncio.run(self.fs.releasedir(fh))
+                    self.assertNotIn(b"secret.txt", names)
+                    self.assertNotIn(b"secrets", names)
+                    self.assertIn(b"work.txt", names)
                     self.assertEqual(
                         bool(asyncio.run(self.fs.getattr(root)).st_mode & 0o222), default
                     )
@@ -901,6 +928,7 @@ class PathWritePolicyTests(unittest.TestCase):
                     asyncio.run(self.fs.unlink(objects, b"new", None))
 
     def test_cli_mount_rejects_invalid_overrides_before_publishing(self):
+        os.symlink("missing", os.path.join(self.source, "dangling"))
         self.control.start()
         self.addCleanup(self.control.stop)
         original = self.fs.list_mounts()
@@ -912,6 +940,12 @@ class PathWritePolicyTests(unittest.TestCase):
             (["--writable", ".git", "--readonly", "../work.txt"], "cannot contain '..'"),
             (["--writable", ""], "cannot be empty"),
             (["--readonly", ".git", "--writable", "./.git/"], "Conflicting"),
+            (["--hide", "missing"], "does not exist"),
+            (["--hide", ".git", "--hide", "missing"], "does not exist"),
+            (["--hide", "dangling"], "does not exist"),
+            (["--hide", "../work.txt"], "cannot contain '..'"),
+            (["--hide", "."], "cannot be empty"),
+            (["--hide", "\0"], "cannot contain NUL"),
         ):
             stderr = io.StringIO()
             with (

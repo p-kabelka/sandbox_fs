@@ -834,11 +834,11 @@ class PathWritePolicyTests(unittest.TestCase):
         self.control.start()
         self.addCleanup(self.control.stop)
         rules = [
-            ("--readonly", ".git/objects/data"),
-            ("--writable", "./.git/objects/"),
-            ("--readonly", ".git"),
-            ("--writable", "work.txt"),
-            ("--readonly", "./.git/"),
+            ("--ro-path", ".git/objects/data"),
+            ("-W", "./.git/objects/"),
+            ("-R", ".git"),
+            ("--rw-path", "work.txt"),
+            ("--ro-path", "./.git/"),
             ("--hide", "./secret.txt"),
             ("--hide", "secrets"),
             ("--hide", "./secrets/"),
@@ -853,6 +853,9 @@ class PathWritePolicyTests(unittest.TestCase):
                     target = f"/mount-{default}-{reverse}"
                     ordered = list(reversed(rules)) if reverse else rules
                     options = [arg for rule in ordered for arg in rule]
+                    mode_options = (
+                        ["--read-write" if reverse else "-w"] if default else []
+                    )
                     args = [
                         "sandbox_fs.py",
                         "mount",
@@ -860,7 +863,7 @@ class PathWritePolicyTests(unittest.TestCase):
                         self.control._path,
                         self.source,
                         target,
-                        *(["-w"] if default else []),
+                        *mode_options,
                         *options,
                     ]
                     published.clear()
@@ -934,12 +937,12 @@ class PathWritePolicyTests(unittest.TestCase):
         original = self.fs.list_mounts()
         self.entries.reset_mock()
         for options, message in (
-            (["--readonly", "missing"], "does not exist"),
-            (["--writable", "missing"], "does not exist"),
-            (["--readonly", ".git", "--writable", "missing"], "does not exist"),
-            (["--writable", ".git", "--readonly", "../work.txt"], "cannot contain '..'"),
-            (["--writable", ""], "cannot be empty"),
-            (["--readonly", ".git", "--writable", "./.git/"], "Conflicting"),
+            (["--ro-path", "missing"], "does not exist"),
+            (["--rw-path", "missing"], "does not exist"),
+            (["-R", ".git", "--rw-path", "missing"], "does not exist"),
+            (["-W", ".git", "--ro-path", "../work.txt"], "cannot contain '..'"),
+            (["-W", ""], "cannot be empty"),
+            (["--ro-path", ".git", "-W", "./.git/"], "Conflicting"),
             (["--hide", "missing"], "does not exist"),
             (["--hide", ".git", "--hide", "missing"], "does not exist"),
             (["--hide", "dangling"], "does not exist"),
@@ -1003,7 +1006,7 @@ class PathWritePolicyTests(unittest.TestCase):
         self.assertIn("readwrite: .git", cli("list"))
         self.open_handle(self.lookup(".git/config"))
         cli("hide", "/project", ".git")
-        cli("unhide", "/project", ".git", "--readonly")
+        cli("unhide", "/project", ".git", "--ro-path")
         cli("save", state_path)
         self.assertEqual(_read_state(state_path)[0]["readonly"], [".git"])
         cli("writable", "/project", ".git")
@@ -1038,7 +1041,7 @@ class PathWritePolicyTests(unittest.TestCase):
             return output.getvalue()
 
         cli("hide", "/reference", ".git")
-        cli("unhide", "/reference", ".git", "--writable")
+        cli("unhide", "/reference", ".git", "--rw-path")
         cli("readonly", "/reference", ".git/config")
         cli("save", state_path)
         saved = next(m for m in _read_state(state_path) if m["target"] == "/reference")
@@ -1088,7 +1091,7 @@ class PathWritePolicyTests(unittest.TestCase):
         cli("readonly", "/project")
         self.assertIn("Loaded: /project", cli("load", state_path, "--force"))
         self.root = self.fs._mounts["/project"]["inode"]
-        cli("unhide", "--readonly", "project", ".git")
+        cli("unhide", "-R", "project", ".git")
         cli("writable", "/project")
         self.assert_denied(self.fs.open(self.lookup(".git/config"), os.O_RDWR, None))
         self.assertEqual(self.fs.list_mounts()[0]["hidden"], [])
@@ -1161,15 +1164,17 @@ class PathWritePolicyTests(unittest.TestCase):
                     "/unused",
                     "--rw-mount",
                     f"{self.source}:/project",
-                    "--readonly",
+                    "--ro-path",
                     "/project:.git",
-                    "--readonly",
+                    "-R",
                     "/project:work.txt",
+                    "-W",
+                    "/project:.git/objects",
                     "--ro-mount",
                     f"{self.source}:/reference",
-                    "--writable",
+                    "--rw-path",
                     "/reference:.git",
-                    "--readonly",
+                    "--ro-path",
                     "/reference:.git/config",
                 ],
             ),
@@ -1185,6 +1190,7 @@ class PathWritePolicyTests(unittest.TestCase):
         fs = init.call_args.args[0]
         state = {m["target"]: m for m in fs.list_mounts()}
         self.assertEqual(state["/project"]["readonly"], [".git", "work.txt"])
+        self.assertEqual(state["/project"]["readwrite"], [".git/objects"])
         self.assertEqual(state["/reference"]["readwrite"], [".git"])
         ino = self.lookup(".git/config", fs=fs, root=fs._mounts["/project"]["inode"])
         self.assert_denied(fs.open(ino, os.O_RDWR, None))
@@ -1197,15 +1203,15 @@ class PathWritePolicyTests(unittest.TestCase):
 
     def test_cli_rejects_conflicting_unhide_flags_and_initial_rules(self):
         for args in (
-            ["unhide", "-s", "/unused", "/project", ".git", "--readonly", "--writable"],
+            ["unhide", "-s", "/unused", "/project", ".git", "-R", "--rw-path"],
             [
                 "daemon",
                 "/unused",
                 "--ro-mount",
                 f"{self.source}:/project",
-                "--readonly",
+                "-R",
                 "/project:.git",
-                "--writable",
+                "-W",
                 "/project:./.git/",
             ],
         ):

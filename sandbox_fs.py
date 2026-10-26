@@ -11,14 +11,15 @@ Usage:
    sandbox_fs.py daemon /mnt/sandbox \\
        --rw-mount /home/user/project:/home/user/project \\
        --ro-mount /home/user/reference:/home/user/reference \\
+       -R /home/user/project:.git -W /home/user/project:.git/objects \\
       --hide /home/user/project:.env
 
   # Add a mount at runtime
-  sandbox_fs.py mount -s /mnt/sandbox.sock /host/path /virtual/path -w
+  sandbox_fs.py mount -s /mnt/sandbox.sock /host/path /virtual/path --read-write
 
   # Add a mount with initial hides and subpath write overrides (repeatable)
   sandbox_fs.py mount -s /mnt/sandbox.sock /host/path /virtual/path -w \\
-      --readonly .git --writable .git/objects --hide .env --hide .secrets
+      -R .git -W .git/objects --hide .env --hide .secrets
 
   # Hide a path within a mount
   sandbox_fs.py hide -s /mnt/sandbox.sock /virtual/mount .secrets
@@ -31,7 +32,7 @@ Usage:
   sandbox_fs.py writable -s /mnt/sandbox.sock /virtual/mount .git
 
   # Unhide a path with a read-only rule applied atomically
-  sandbox_fs.py unhide -s /mnt/sandbox.sock /virtual/mount .secrets --readonly
+  sandbox_fs.py unhide -s /mnt/sandbox.sock /virtual/mount .secrets --ro-path
 
   # Grant write access to a path within a read-only mount
   sandbox_fs.py writable -s /mnt/sandbox.sock /virtual/mount editable
@@ -1561,18 +1562,22 @@ def main():
         help="Initial hide (repeatable)",
     )
     d.add_argument(
-        "--readonly",
+        "-R",
+        "--ro-path",
+        dest="readonly",
         action="append",
         default=[],
         metavar="TGT:RELPATH",
         help="Initial read-only path rule (repeatable; includes descendants)",
     )
     d.add_argument(
-        "--writable",
+        "-W",
+        "--rw-path",
+        dest="writable",
         action="append",
         default=[],
         metavar="TGT:RELPATH",
-        help="Initial writable path rule (repeatable; includes descendants)",
+        help="Initial read-write path rule (repeatable; includes descendants)",
     )
     d.add_argument(
         "--entry-timeout",
@@ -1595,9 +1600,10 @@ def main():
     m.add_argument("target", nargs="?", default=None)
     m.add_argument(
         "-w",
+        "--read-write",
         dest="writable",
         action="store_true",
-        help="Make the mount writable by default (default: read-only)",
+        help="Make the mount read-write by default (default: read-only)",
     )
     m.add_argument(
         "--hide",
@@ -1607,19 +1613,22 @@ def main():
         help="Initially hidden subpath (repeatable; includes descendants)",
     )
     m.add_argument(
-        "--readonly",
+        "-R",
+        "--ro-path",
+        dest="readonly",
         action="append",
         default=[],
         metavar="RELPATH",
         help="Read-only subpath override (repeatable; includes descendants)",
     )
     m.add_argument(
-        "--writable",
+        "-W",
+        "--rw-path",
         dest="readwrite",
         action="append",
         default=[],
         metavar="RELPATH",
-        help="Writable subpath override (repeatable; includes descendants)",
+        help="Read-write subpath override (repeatable; includes descendants)",
     )
 
     # -- unmount --
@@ -1640,14 +1649,18 @@ def main():
     uh.add_argument("path")
     unhide_policy = uh.add_mutually_exclusive_group()
     unhide_policy.add_argument(
-        "--readonly",
+        "-R",
+        "--ro-path",
+        dest="readonly",
         action="store_true",
         help="Set a read-only override before making the path visible",
     )
     unhide_policy.add_argument(
-        "--writable",
+        "-W",
+        "--rw-path",
+        dest="writable",
         action="store_true",
-        help="Set a writable override before making the path visible",
+        help="Set a read-write override before making the path visible",
     )
 
     # -- mount and per-path write policy --

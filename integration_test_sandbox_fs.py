@@ -166,7 +166,7 @@ class FuseIntegrationTests(unittest.TestCase):
             "mount",
             "-s",
             self.socket_path,
-            "-w",
+            "--read-write",
             self.source_rw,
             "/writable",
         )
@@ -318,7 +318,7 @@ class FuseIntegrationTests(unittest.TestCase):
         self.assertFalse(secret.exists())
         self.assertNotIn("secret.txt", {entry.name for entry in project.iterdir()})
         self._cli(
-            "unhide", "-s", self.socket_path, "--readonly", "/project", "secret.txt"
+            "unhide", "-s", self.socket_path, "-R", "/project", "secret.txt"
         )
 
         with open(editable, "r+b", buffering=0) as writer:
@@ -462,7 +462,7 @@ class FuseIntegrationTests(unittest.TestCase):
             self.socket_path,
             "/project",
             "secret.txt",
-            "--readonly",
+            "--ro-path",
         )
         self.assertEqual(secret.read_text(encoding="utf-8"), "hidden data\n")
         self._assert_read_only(secret)
@@ -561,9 +561,9 @@ class FuseIntegrationTests(unittest.TestCase):
             self.socket_path,
             self.source_ro,
             "/reference",
-            "--writable",
+            "-W",
             "cache",
-            "--readonly",
+            "--ro-path",
             "cache/index",
         )
         reference = self.mountpoint / "reference"
@@ -602,7 +602,7 @@ class FuseIntegrationTests(unittest.TestCase):
             self.socket_path,
             "/reference",
             "reference.txt",
-            "--writable",
+            "-W",
         )
         file_path.write_text("writable", encoding="utf-8")
         self.assertEqual(

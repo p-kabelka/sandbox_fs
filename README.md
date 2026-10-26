@@ -15,18 +15,18 @@ commands.
 
 ## Mount and per-path read/write policies
 
-Set subpath overrides when adding a mount with repeatable `--readonly RELPATH`
-and `--writable RELPATH` options. The mount is read-only by default; `-w` makes
-its default writable:
+Set subpath overrides when adding a mount with repeatable `-R`/`--ro-path RELPATH`
+and `-W`/`--rw-path RELPATH` options. The mount is read-only by default;
+`-w`/`--read-write` makes its default writable:
 
 ```sh
 # Writable project, read-only .git, writable .git/objects, read-only work.txt
-python sandbox_fs.py mount -s /mnt/sandbox.sock /host/project /project -w \
-    --readonly .git --writable .git/objects --readonly work.txt
+python sandbox_fs.py mount -s /mnt/sandbox.sock /host/project /project --read-write \
+    --ro-path .git --rw-path .git/objects --ro-path work.txt
 
 # Read-only reference, writable cache and output, read-only cache/index
 python sandbox_fs.py mount -s /mnt/sandbox.sock /host/reference /reference \
-    --writable cache --writable output --readonly cache/index
+    -W cache -W output -R cache/index
 ```
 
 Both options can be repeated and combined, with the most-specific matching
@@ -39,7 +39,7 @@ options, which can be combined with write-policy overrides:
 
 ```sh
 python sandbox_fs.py mount -s /mnt/sandbox.sock /host/project /project -w \
-    --hide .env --hide .secrets --readonly .git
+    --hide .env --hide .secrets -R .git
 ```
 
 Hidden paths must exist and are validated and installed before the mount
@@ -54,8 +54,8 @@ python sandbox_fs.py readonly -s /mnt/sandbox.sock /project
 ```
 
 These commands preserve all hidden paths and explicit read-only and writable
-subpath overrides, including rules set by `unhide --readonly` or
-`unhide --writable`. Only paths without a matching override inherit the new
+subpath overrides, including rules set by `unhide --ro-path` or
+`unhide --rw-path`. Only paths without a matching override inherit the new
 mount default.
 
 With a relative path, both commands set explicit overrides for a file or
@@ -100,16 +100,20 @@ Hiding a path and ordinary `unhide` preserve its overrides. To set a policy
 and unhide atomically:
 
 ```sh
-python sandbox_fs.py unhide -s /mnt/sandbox.sock /project .git --readonly
-python sandbox_fs.py unhide -s /mnt/sandbox.sock /reference editable --writable
+python sandbox_fs.py unhide -s /mnt/sandbox.sock /project .git -R
+python sandbox_fs.py unhide -s /mnt/sandbox.sock /reference editable -W
 ```
 
-Configure initial rules on startup:
+For `unhide`, `-R`/`--ro-path` and `-W`/`--rw-path` are mutually exclusive flags
+without arguments; the positional path selects the subpath.
+
+Configure initial rules on startup with `-R`/`--ro-path` and `-W`/`--rw-path`,
+using `TGT:RELPATH` for each rule:
 
 ```sh
 python sandbox_fs.py daemon /mnt/sandbox \
-    --rw-mount /host/project:/project --readonly /project:.git \
-    --ro-mount /host/reference:/reference --writable /reference:editable
+    --rw-mount /host/project:/project --ro-path /project:.git \
+    --ro-mount /host/reference:/reference --rw-path /reference:editable
 ```
 
 Runtime changes invalidate kernel caches. `list` shows the rules, and `save`
